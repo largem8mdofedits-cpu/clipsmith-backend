@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const Stripe = require('stripe');
@@ -11,13 +10,10 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
 // CLIENT_URL is your deployed frontend's origin (set in .env / Railway
-// variables). Falls back to localhost for local dev. This must be a real
-// origin (not '*') because credentials:true requires an explicit origin,
-// and the frontend calls this API with credentials:'include'.
+// variables). Falls back to localhost for local dev.
 const CLIENT_ORIGIN = process.env.CLIENT_URL || 'http://localhost:3000';
 app.use(cors({
   origin: CLIENT_ORIGIN,
-  credentials: true
 }));
 /**
  * Stripe webhook — must be registered BEFORE express.json(),
@@ -102,45 +98,76 @@ app.post(
 
 app.use(express.json());
 
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'dev-only-secret-change-me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    maxAge: 1000 * 60 * 60 * 24 * 30, // 30 days
-    httpOnly: true,
-    // Frontend and backend live on different domains once deployed (e.g.
-    // Netlify + Railway), so this is a cross-site fetch from the browser's
-    // point of view. SameSite=Lax cookies are NOT sent on cross-site
-    // fetch/XHR (only on top-level navigations), which would silently
-    // break login — every /api/me call would look logged-out. SameSite=None
-    // fixes that, but requires Secure (HTTPS-only), which is why it's
-    // conditional on NODE_ENV=production; local dev over plain http keeps
-    // 'lax' since Secure cookies are dropped over http by the browser.
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    secure: process.env.NODE_ENV === 'production', // requires HTTPS in production
-  },
-}));
-// NOTE: this uses express-session's default in-memory store, which is fine
-// for local development but resets on every restart and won't scale across
-// multiple server instances. For production, swap in a real session store
-// (e.g. connect-pg-simple if you're on Postgres, or connect-redis).
+// ---------------------------------------------------------------------------
+// Auth — bearer tokens, not cookies.
+//
+// This was originally built on cookie sessions (express-session), which
+// works fine when frontend and backend share a domain. Once deployed,
+// though, they live on different Railway subdomains — a cross-site
+// situation from the browser's point of view. Getting cross-site cookies
+// right (SameSite=None; Secure) technically works, but modern browsers
+// increasingly block third-party cookies by default regardless of those
+// settings, which silently broke login in production (every /api/me call
+// looked logged-out even right after a successful signup).
+//
+// Bearer tokens sidestep the problem entirely: the frontend stores the
+// token (localStorage) and sends it explicitly via the Authorization
+// header, so there's no cookie for the browser's third-party-cookie policy
+// to block. Each user gets one active token, stored alongside them in
+// data.json — fine at this scale; move to a real token/session table (with
+// expiry) if this needs to scale past one server instance.
+// ---------------------------------------------------------------------------
+function issueToken(user){
+  user.authToken = crypto.randomBytes(32).toString('hex');
+  return user.authToken;
+}
 
-const FREE_TRIAL_SECONDS = 60 * 60; // 1 free hour for every new account
+const FREE_TRIAL_SECONDS = 60 * 60; // 1 free hour, refilled weekly on the free plan
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Free-plan users get their hour topped back up to full once a week,
+// rather than a one-time trial. `freeHourResetAt` tracks when the current
+// week's allowance started; any time we touch a user's balance, we first
+// check whether a week has passed and top them back up if so. This keeps
+// the reset lazy (no cron job needed) — it just resolves itself the next
+// time the user is looked at, which is fine since freeSecondsRemaining is
+// only ever read right before/after a render.
+function refillWeeklyFreeHour(user){
+  if(user.plan !== 'free') return false;
+  const resetAt = user.freeHourResetAt ? new Date(user.freeHourResetAt).getTime() : 0;
+  if(Date.now() - resetAt >= WEEK_MS){
+    user.freeSecondsRemaining = FREE_TRIAL_SECONDS;
+    user.freeHourResetAt = new Date().toISOString();
+    return true;
+  }
+  return false;
+}
 
 function requireAuth(req, res, next){
-  if(!req.session.userId) return res.status(401).json({ error: 'Not signed in' });
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if(!token) return res.status(401).json({ error: 'Not signed in' });
+
+  const data = db.readDB();
+  const user = data.users.find(u => u.authToken === token);
+  if(!user) return res.status(401).json({ error: 'Not signed in' });
+
+  req.user = user;
   next();
 }
 
-function publicUser(user){
-  return {
+// includeToken: signup/login need to hand the token back to the frontend
+// once, right after auth; /api/me shouldn't re-send it on every poll.
+function publicUser(user, includeToken){
+  const out = {
     id: user.id,
     email: user.email,
     plan: user.plan,
     freeSecondsRemaining: user.freeSecondsRemaining,
     createdAt: user.createdAt,
   };
+  if(includeToken) out.token = user.authToken;
+  return out;
 }
 
 app.post('/api/signup', async (req, res) => {
@@ -160,14 +187,15 @@ app.post('/api/signup', async (req, res) => {
     passwordHash,
     plan: 'free',
     freeSecondsRemaining: FREE_TRIAL_SECONDS,
+    freeHourResetAt: new Date().toISOString(),
     stripeCustomerId: null,
     createdAt: new Date().toISOString(),
   };
+  issueToken(user);
   data.users.push(user);
   db.writeDB(data);
 
-  req.session.userId = user.id;
-  res.json(publicUser(user));
+  res.json(publicUser(user, true));
 });
 
 app.post('/api/login', async (req, res) => {
@@ -179,18 +207,24 @@ app.post('/api/login', async (req, res) => {
   const valid = await bcrypt.compare(password || '', user.passwordHash);
   if(!valid) return res.status(401).json({ error: 'Incorrect email or password' });
 
-  req.session.userId = user.id;
-  res.json(publicUser(user));
+  issueToken(user);
+  refillWeeklyFreeHour(user);
+  db.writeDB(data);
+  res.json(publicUser(user, true));
 });
 
-app.post('/api/logout', (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+app.post('/api/logout', requireAuth, (req, res) => {
+  const data = db.readDB();
+  const user = data.users.find(u => u.id === req.user.id);
+  if(user){ delete user.authToken; db.writeDB(data); }
+  res.json({ ok: true });
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
   const data = db.readDB();
-  const user = data.users.find(u => u.id === req.session.userId);
+  const user = data.users.find(u => u.id === req.user.id);
   if(!user) return res.status(401).json({ error: 'Not signed in' });
+  if(refillWeeklyFreeHour(user)) db.writeDB(data);
   res.json(publicUser(user));
 });
 
@@ -206,14 +240,16 @@ app.post('/api/consume-time', requireAuth, (req, res) => {
   if (seconds <= 0) return res.status(400).json({ error: 'seconds must be a positive number' });
 
   const data = db.readDB();
-  const user = data.users.find(u => u.id === req.session.userId);
+  const user = data.users.find(u => u.id === req.user.id);
   if (!user) return res.status(401).json({ error: 'Not signed in' });
+
+  refillWeeklyFreeHour(user); // top back up to a full hour if a new week has started
 
   // Paid plans aren't metered against freeSecondsRemaining at all — only
   // free-plan users hit this wall. Adjust here if you want paid plans to
   // have their own usage caps later.
   if (user.plan === 'free' && (user.freeSecondsRemaining || 0) <= 0) {
-    return res.status(402).json({ error: 'Free hour used up — subscribe to keep rendering.', freeSecondsRemaining: 0 });
+    return res.status(402).json({ error: 'This week\'s free hour is used up — it refills next week, or subscribe to keep rendering now.', freeSecondsRemaining: 0 });
   }
 
   user.freeSecondsRemaining = Math.max(0, (user.freeSecondsRemaining || 0) - seconds);
@@ -245,12 +281,17 @@ app.post('/api/create-checkout-session', async (req, res) => {
       return res.status(400).json({ error: `Unknown plan/billing combo: ${key}` });
     }
 
+    // Optional: attach the signed-in user if a valid token was sent, so the
+    // webhook can link this payment back to an account. Checkout also works
+    // signed-out (userId stays undefined), matching the original behavior.
     let customerEmail;
-    let userId = req.session.userId || undefined;
-    if (userId) {
+    let userId;
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (token) {
       const data = db.readDB();
-      const user = data.users.find(u => u.id === userId);
-      if (user) customerEmail = user.email;
+      const user = data.users.find(u => u.authToken === token);
+      if (user) { userId = user.id; customerEmail = user.email; }
     }
 
     const session = await stripe.checkout.sessions.create({
