@@ -9,6 +9,14 @@ const db = require('./db');
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
+// Railway sits in front of this service as a reverse proxy, so without
+// this, req.ip returns Railway's internal proxy address for every request
+// instead of the real client IP — which would make the per-IP signup
+// throttle below useless (every signup would appear to come from the same
+// "IP"). Trusting the proxy chain makes Express read the real client IP
+// from X-Forwarded-For instead.
+app.set('trust proxy', true);
+
 // Auth uses bearer tokens (not cookies), so CORS doesn't need credentials
 // mode and there's no security reason to lock this to one exact origin —
 // doing so was actually breaking sign-in whenever the site got redeployed
@@ -128,25 +136,49 @@ function issueToken(user){
   return user.authToken;
 }
 
-const FREE_TRIAL_SECONDS = 60 * 60; // 1 free hour, refilled weekly on the free plan
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+// Free plan: a one-time signup bonus, NOT a recurring weekly refill.
+// This is deliberate — a recurring free allowance makes multi-accounting
+// (sign up again with a new email once you've used your free tier) far
+// more valuable to abuse. A one-time bonus, paired with the signup
+// throttling below, makes repeat-signup abuse much less worth the effort.
+const FREE_TRIES = 1;
+const FREE_MB = 10;
 
-// Free-plan users get their hour topped back up to full once a week,
-// rather than a one-time trial. `freeHourResetAt` tracks when the current
-// week's allowance started; any time we touch a user's balance, we first
-// check whether a week has passed and top them back up if so. This keeps
-// the reset lazy (no cron job needed) — it just resolves itself the next
-// time the user is looked at, which is fine since freeSecondsRemaining is
-// only ever read right before/after a render.
-function refillWeeklyFreeHour(user){
-  if(user.plan !== 'free') return false;
-  const resetAt = user.freeHourResetAt ? new Date(user.freeHourResetAt).getTime() : 0;
-  if(Date.now() - resetAt >= WEEK_MS){
-    user.freeSecondsRemaining = FREE_TRIAL_SECONDS;
-    user.freeHourResetAt = new Date().toISOString();
-    return true;
-  }
-  return false;
+// Very small, dependency-free anti-abuse layer for the free-tier signup
+// bonus. Two independent checks, both best-effort (this is a single-
+// instance file-based app, not a full fraud stack):
+//   1) Disposable/throwaway email domains are rejected outright.
+//   2) Signups are throttled per IP address — a real person doesn't need
+//      more than a couple of free accounts from the same connection.
+// Neither is bulletproof (VPNs, mobile carrier NAT, etc. all exist), but
+// together they raise the cost of farming free accounts well above what
+// a casual abuser will bother with.
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+  'mailinator.com', 'guerrillamail.com', 'guerrillamail.info', '10minutemail.com',
+  '10minutemail.net', 'tempmail.com', 'temp-mail.org', 'throwawaymail.com',
+  'yopmail.com', 'trashmail.com', 'getnada.com', 'dispostable.com',
+  'sharklasers.com', 'fakeinbox.com', 'maildrop.cc', 'mintemail.com',
+  'mohmal.com', 'moakt.com', 'emailondeck.com', 'spamgourmet.com',
+]);
+
+const SIGNUPS_PER_IP_LIMIT = 2;      // max free-tier signups from one IP...
+const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 days
+
+function isDisposableEmail(email){
+  const domain = (email.split('@')[1] || '').toLowerCase();
+  return DISPOSABLE_EMAIL_DOMAINS.has(domain);
+}
+
+function getClientIp(req){
+  // req.ip respects Express's `trust proxy` setting (enabled below), so
+  // this reads the real client IP from X-Forwarded-For on Railway instead
+  // of Railway's internal proxy IP.
+  return req.ip || req.connection?.remoteAddress || 'unknown';
+}
+
+function signupsFromIpRecently(data, ip){
+  const cutoff = Date.now() - SIGNUPS_PER_IP_WINDOW_MS;
+  return data.users.filter(u => u.signupIp === ip && new Date(u.createdAt).getTime() >= cutoff).length;
 }
 
 function requireAuth(req, res, next){
@@ -169,7 +201,8 @@ function publicUser(user, includeToken){
     id: user.id,
     email: user.email,
     plan: user.plan,
-    freeSecondsRemaining: user.freeSecondsRemaining,
+    freeTriesRemaining: user.freeTriesRemaining,
+    freeMbRemaining: user.freeMbRemaining,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -181,10 +214,18 @@ app.post('/api/signup', async (req, res) => {
   if(!email || !password || password.length < 8){
     return res.status(400).json({ error: 'Enter a valid email and a password with at least 8 characters' });
   }
+  if(isDisposableEmail(email)){
+    return res.status(400).json({ error: 'Please sign up with a permanent email address' });
+  }
 
   const data = db.readDB();
   const existing = data.users.find(u => u.email.toLowerCase() === email.toLowerCase());
   if(existing) return res.status(400).json({ error: 'An account with that email already exists' });
+
+  const ip = getClientIp(req);
+  if(signupsFromIpRecently(data, ip) >= SIGNUPS_PER_IP_LIMIT){
+    return res.status(429).json({ error: "Too many free accounts created from this connection recently — subscribe to keep going, or try again later." });
+  }
 
   const passwordHash = await bcrypt.hash(password, 10);
   const user = {
@@ -192,8 +233,9 @@ app.post('/api/signup', async (req, res) => {
     email,
     passwordHash,
     plan: 'free',
-    freeSecondsRemaining: FREE_TRIAL_SECONDS,
-    freeHourResetAt: new Date().toISOString(),
+    freeTriesRemaining: FREE_TRIES,
+    freeMbRemaining: FREE_MB,
+    signupIp: ip,
     stripeCustomerId: null,
     createdAt: new Date().toISOString(),
   };
@@ -214,7 +256,6 @@ app.post('/api/login', async (req, res) => {
   if(!valid) return res.status(401).json({ error: 'Incorrect email or password' });
 
   issueToken(user);
-  refillWeeklyFreeHour(user);
   db.writeDB(data);
   res.json(publicUser(user, true));
 });
@@ -230,35 +271,39 @@ app.get('/api/me', requireAuth, (req, res) => {
   const data = db.readDB();
   const user = data.users.find(u => u.id === req.user.id);
   if(!user) return res.status(401).json({ error: 'Not signed in' });
-  if(refillWeeklyFreeHour(user)) db.writeDB(data);
   res.json(publicUser(user));
 });
 
 /**
- * Deducts render time from a user's free-hour balance. Call this whenever
- * your product actually renders something for a free-plan user. Paid plans
- * should be metered differently (or not at all, depending on your model) —
- * this endpoint only touches freeSecondsRemaining, so it's a no-op cost
- * center for paid users unless you choose to call it for them too.
+ * Deducts one "try" and some MB from a user's one-time free-tier bonus.
+ * Call this once per completed render for free-plan users (mbUsed = the
+ * total size of the clip(s) that render produced). Free tier is a
+ * one-time 2-tries/10MB signup bonus, NOT a recurring allowance — once
+ * either runs out, the user has to subscribe. Paid plans aren't metered
+ * against this at all; adjust here if you want paid-plan usage caps later.
  */
-app.post('/api/consume-time', requireAuth, (req, res) => {
-  const seconds = Number(req.body.seconds) || 0;
-  if (seconds <= 0) return res.status(400).json({ error: 'seconds must be a positive number' });
+app.post('/api/consume-usage', requireAuth, (req, res) => {
+  const mbUsed = Number(req.body.mbUsed) || 0;
+  if (mbUsed < 0) return res.status(400).json({ error: 'mbUsed must not be negative' });
 
   const data = db.readDB();
   const user = data.users.find(u => u.id === req.user.id);
   if (!user) return res.status(401).json({ error: 'Not signed in' });
 
-  refillWeeklyFreeHour(user); // top back up to a full hour if a new week has started
-
-  // Paid plans aren't metered against freeSecondsRemaining at all — only
-  // free-plan users hit this wall. Adjust here if you want paid plans to
-  // have their own usage caps later.
-  if (user.plan === 'free' && (user.freeSecondsRemaining || 0) <= 0) {
-    return res.status(402).json({ error: 'This week\'s free hour is used up — it refills next week, or subscribe to keep rendering now.', freeSecondsRemaining: 0 });
+  if (user.plan === 'free') {
+    const triesLeft = user.freeTriesRemaining ?? 0;
+    const mbLeft = user.freeMbRemaining ?? 0;
+    if (triesLeft <= 0 || mbLeft <= 0) {
+      return res.status(402).json({
+        error: 'Your free trial is used up — subscribe to keep rendering.',
+        freeTriesRemaining: Math.max(0, triesLeft),
+        freeMbRemaining: Math.max(0, mbLeft),
+      });
+    }
+    user.freeTriesRemaining = Math.max(0, triesLeft - 1);
+    user.freeMbRemaining = Math.max(0, mbLeft - mbUsed);
   }
 
-  user.freeSecondsRemaining = Math.max(0, (user.freeSecondsRemaining || 0) - seconds);
   db.writeDB(data);
   res.json(publicUser(user));
 });
