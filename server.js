@@ -9,12 +9,18 @@ const db = require('./db');
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
-// CLIENT_URL is your deployed frontend's origin (set in .env / Railway
-// variables). Falls back to localhost for local dev.
-const CLIENT_ORIGIN = process.env.CLIENT_URL || 'http://localhost:3000';
-app.use(cors({
-  origin: CLIENT_ORIGIN,
-}));
+// Auth uses bearer tokens (not cookies), so CORS doesn't need credentials
+// mode and there's no security reason to lock this to one exact origin —
+// doing so was actually breaking sign-in whenever the site got redeployed
+// under a second Railway domain (a random name Railway assigns if the
+// intended service name is taken), since the browser's Origin header no
+// longer matched this single hardcoded value and the request got silently
+// blocked before it ever reached these routes. Reflecting any origin keeps
+// things working regardless of which domain the frontend is served from.
+app.use(cors());
+
+// CLIENT_URL is still used later (Stripe success/cancel/portal redirect
+// URLs) — keep it set in Railway variables to your primary frontend domain.
 /**
  * Stripe webhook — must be registered BEFORE express.json(),
  * because Stripe needs the raw, unparsed request body to verify the signature.
