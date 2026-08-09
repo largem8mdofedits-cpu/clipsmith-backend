@@ -136,13 +136,14 @@ function issueToken(user){
   return user.authToken;
 }
 
-// Free plan: a one-time signup bonus, NOT a recurring weekly refill.
-// This is deliberate — a recurring free allowance makes multi-accounting
-// (sign up again with a new email once you've used your free tier) far
-// more valuable to abuse. A one-time bonus, paired with the signup
-// throttling below, makes repeat-signup abuse much less worth the effort.
-const FREE_TRIES = 1;
-const FREE_MB = 10;
+// Free plan: uploads only, one-time signup bonus (NOT a recurring
+// refill — same reasoning as before, a recurring allowance makes
+// multi-accounting far more worth the effort). Uploads never touch the
+// residential proxy, so they cost almost nothing to give away. YouTube-
+// link clipping DOES pull bandwidth through the paid proxy, so it's
+// gated to paid plans only — see /api/consume-usage below, there's no
+// free amount of that which is cheap enough to hand out.
+const FREE_UPLOAD_TRIES = 10;
 
 // Very small, dependency-free anti-abuse layer for the free-tier signup
 // bonus. Two independent checks, both best-effort (this is a single-
@@ -201,8 +202,8 @@ function publicUser(user, includeToken){
     id: user.id,
     email: user.email,
     plan: user.plan,
-    freeTriesRemaining: user.freeTriesRemaining,
-    freeMbRemaining: user.freeMbRemaining,
+    freeUploadTriesRemaining: user.freeUploadTriesRemaining,
+    totalProxyMbUsed: user.totalProxyMbUsed || 0,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -233,8 +234,8 @@ app.post('/api/signup', async (req, res) => {
     email,
     passwordHash,
     plan: 'free',
-    freeTriesRemaining: FREE_TRIES,
-    freeMbRemaining: FREE_MB,
+    freeUploadTriesRemaining: FREE_UPLOAD_TRIES,
+    totalProxyMbUsed: 0,
     signupIp: ip,
     stripeCustomerId: null,
     createdAt: new Date().toISOString(),
@@ -275,37 +276,106 @@ app.get('/api/me', requireAuth, (req, res) => {
 });
 
 /**
- * Deducts one "try" and some MB from a user's one-time free-tier bonus.
- * Call this once per completed render for free-plan users (mbUsed = the
- * total size of the clip(s) that render produced). Free tier is a
- * one-time 2-tries/10MB signup bonus, NOT a recurring allowance — once
- * either runs out, the user has to subscribe. Paid plans aren't metered
- * against this at all; adjust here if you want paid-plan usage caps later.
+ * Records usage after a completed render and enforces plan limits.
+ *
+ * source: 'upload' | 'youtube'. Uploads never touch the proxy, so free-
+ * plan users get a limited number of one-time free upload tries.
+ * YouTube-link jobs always pull bandwidth through the paid residential
+ * proxy, so they're paid-plans-only — free users are rejected outright,
+ * no tries consumed either way.
+ *
+ * proxyMbUsed: how much bandwidth THIS job pulled through the proxy (0
+ * for uploads, the downloaded source video's size for YouTube links).
+ * Accumulated per user regardless of plan, so paid users' proxy usage is
+ * visible on the admin stats dashboard below.
  */
 app.post('/api/consume-usage', requireAuth, (req, res) => {
-  const mbUsed = Number(req.body.mbUsed) || 0;
-  if (mbUsed < 0) return res.status(400).json({ error: 'mbUsed must not be negative' });
+  const source = req.body.source === 'youtube' ? 'youtube' : 'upload';
+  const proxyMbUsed = Math.max(0, Number(req.body.proxyMbUsed) || 0);
 
   const data = db.readDB();
   const user = data.users.find(u => u.id === req.user.id);
   if (!user) return res.status(401).json({ error: 'Not signed in' });
 
+  if (source === 'youtube' && user.plan === 'free') {
+    return res.status(402).json({
+      error: 'Pasting a YouTube link requires a paid plan — try uploading a file instead (free), or subscribe to unlock links.',
+    });
+  }
+
   if (user.plan === 'free') {
-    const triesLeft = user.freeTriesRemaining ?? 0;
-    const mbLeft = user.freeMbRemaining ?? 0;
-    if (triesLeft <= 0 || mbLeft <= 0) {
+    const triesLeft = user.freeUploadTriesRemaining ?? 0;
+    if (triesLeft <= 0) {
       return res.status(402).json({
-        error: 'Your free trial is used up — subscribe to keep rendering.',
-        freeTriesRemaining: Math.max(0, triesLeft),
-        freeMbRemaining: Math.max(0, mbLeft),
+        error: 'Your free uploads are used up — subscribe to keep rendering.',
+        freeUploadTriesRemaining: 0,
       });
     }
-    user.freeTriesRemaining = Math.max(0, triesLeft - 1);
-    user.freeMbRemaining = Math.max(0, mbLeft - mbUsed);
+    user.freeUploadTriesRemaining = Math.max(0, triesLeft - 1);
   }
+
+  user.totalProxyMbUsed = (user.totalProxyMbUsed || 0) + proxyMbUsed;
 
   db.writeDB(data);
   res.json(publicUser(user));
+});
+
+// ---------------------------------------------------------------------------
+// Admin stats — a minimal, live "database view" of paying users and profit,
+// gated by a single shared secret (ADMIN_KEY, set in Railway variables).
+// Not a real auth system — fine for a solo founder checking numbers, not
+// something to hand out to a team. Cost figures mirror the profit-model
+// spreadsheet's Pricing Tiers tab (Decodo $3.00/GB + Deepgram + Claude +
+// ElevenLabs + Railway + Stripe fee, at $19/$49/$129 pricing) — update
+// both places together if pricing or vendor rates change.
+// ---------------------------------------------------------------------------
+function requireAdmin(req, res, next){
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if(!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY){
+    return res.status(401).json({ error: 'Not authorized' });
+  }
+  next();
+}
+
+const PLAN_PRICES = { starter: 19, pro: 49, elite: 129 };
+const PLAN_EST_COST = { starter: 4.90, pro: 15.22, elite: 58.05 };
+
+app.get('/api/admin/stats', requireAdmin, (req, res) => {
+  const data = db.readDB();
+  const paidUsers = data.users.filter(u => u.plan && u.plan !== 'free');
+
+  const byPlan = {};
+  for(const plan of Object.keys(PLAN_PRICES)){
+    const users = paidUsers.filter(u => u.plan === plan);
+    byPlan[plan] = {
+      count: users.length,
+      mrr: Math.round(users.length * PLAN_PRICES[plan] * 100) / 100,
+      estMonthlyCost: Math.round(users.length * PLAN_EST_COST[plan] * 100) / 100,
+      estMonthlyProfit: Math.round(users.length * (PLAN_PRICES[plan] - PLAN_EST_COST[plan]) * 100) / 100,
+    };
+  }
+  const totals = Object.values(byPlan).reduce((acc, p) => ({
+    mrr: acc.mrr + p.mrr,
+    estMonthlyCost: acc.estMonthlyCost + p.estMonthlyCost,
+    estMonthlyProfit: acc.estMonthlyProfit + p.estMonthlyProfit,
+  }), { mrr: 0, estMonthlyCost: 0, estMonthlyProfit: 0 });
+
+  res.json({
+    generatedAt: new Date().toISOString(),
+    totalUsers: data.users.length,
+    freeUsers: data.users.length - paidUsers.length,
+    paidUserCount: paidUsers.length,
+    paidUsers: paidUsers
+      .map(u => ({
+        email: u.email,
+        plan: u.plan,
+        joinedAt: u.createdAt,
+        totalProxyMbUsed: Math.round((u.totalProxyMbUsed || 0) * 10) / 10,
+      }))
+      .sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)),
+    byPlan,
+    totals,
+  });
 });
 
 // Map (plan + billing period) -> the Stripe Price ID you create in the Dashboard.
