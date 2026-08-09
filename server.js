@@ -165,6 +165,64 @@ const DISPOSABLE_EMAIL_DOMAINS = new Set([
 const SIGNUPS_PER_IP_LIMIT = 2;      // max free-tier signups from one IP...
 const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 days
 
+// Monthly source-video minute caps per paid plan — mirrors the copy on the
+// pricing page ("150 min of source video / month" etc). Applies to total
+// source video processed (uploads AND YouTube links both count — the cap
+// exists because of transcription/render cost, not just proxy bandwidth).
+// Free plan has no minute cap; it's limited by freeUploadTriesRemaining
+// instead. Resets on the calendar month, not each user's actual Stripe
+// billing date — good enough for a solo-founder-scale app, and avoids an
+// extra Stripe API call per usage check.
+const PLAN_MONTHLY_MINUTES = { starter: 150, pro: 500, elite: 2000 };
+
+function currentPeriod(){
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; // "2026-08"
+}
+
+function todayKey(){
+  return new Date().toISOString().slice(0, 10); // "2026-08-10", UTC calendar day
+}
+
+// A user's monthlyMinutesUsed only means something if usagePeriod matches
+// the current calendar month — otherwise it's a stale count from a prior
+// month that just hasn't been touched (and therefore reset) yet. Used for
+// read-only reporting (publicUser, admin stats) so those endpoints don't
+// need to mutate the DB just to answer "how much has this user used".
+function effectiveMonthlyMinutes(user){
+  return user.usagePeriod === currentPeriod() ? (user.monthlyMinutesUsed || 0) : 0;
+}
+
+// Rolls a user's monthly usage counter over if the calendar month has
+// changed since it was last touched. Mutates in place — caller is
+// responsible for writing the DB afterward. Only called from the write
+// path (/api/consume-usage), not from read-only endpoints.
+function ensureCurrentPeriod(user){
+  const period = currentPeriod();
+  if(user.usagePeriod !== period){
+    user.usagePeriod = period;
+    user.monthlyMinutesUsed = 0;
+  }
+}
+
+// Lightweight per-day usage log, kept per user for the last 90 days —
+// powers the "Daily Usage" view in the stats Sheet. Not meant as a
+// billing source of truth (monthlyMinutesUsed above is), just visibility.
+function recordDailyUsage(user, { minutes, proxyMb }){
+  const day = todayKey();
+  user.dailyUsage = user.dailyUsage || {};
+  const entry = user.dailyUsage[day] || { minutes: 0, proxyMb: 0, jobs: 0 };
+  entry.minutes = Math.round((entry.minutes + minutes) * 100) / 100;
+  entry.proxyMb = Math.round((entry.proxyMb + proxyMb) * 100) / 100;
+  entry.jobs += 1;
+  user.dailyUsage[day] = entry;
+
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  for(const key of Object.keys(user.dailyUsage)){
+    if(new Date(`${key}T00:00:00Z`).getTime() < cutoff) delete user.dailyUsage[key];
+  }
+}
+
 function isDisposableEmail(email){
   const domain = (email.split('@')[1] || '').toLowerCase();
   return DISPOSABLE_EMAIL_DOMAINS.has(domain);
@@ -204,6 +262,8 @@ function publicUser(user, includeToken){
     plan: user.plan,
     freeUploadTriesRemaining: user.freeUploadTriesRemaining,
     totalProxyMbUsed: user.totalProxyMbUsed || 0,
+    monthlyMinutesUsed: Math.round(effectiveMonthlyMinutes(user) * 10) / 10,
+    monthlyMinutesCap: PLAN_MONTHLY_MINUTES[user.plan] || null,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -236,6 +296,9 @@ app.post('/api/signup', async (req, res) => {
     plan: 'free',
     freeUploadTriesRemaining: FREE_UPLOAD_TRIES,
     totalProxyMbUsed: 0,
+    usagePeriod: currentPeriod(),
+    monthlyMinutesUsed: 0,
+    dailyUsage: {},
     signupIp: ip,
     stripeCustomerId: null,
     createdAt: new Date().toISOString(),
@@ -292,6 +355,7 @@ app.get('/api/me', requireAuth, (req, res) => {
 app.post('/api/consume-usage', requireAuth, (req, res) => {
   const source = req.body.source === 'youtube' ? 'youtube' : 'upload';
   const proxyMbUsed = Math.max(0, Number(req.body.proxyMbUsed) || 0);
+  const sourceMinutes = Math.max(0, Number(req.body.sourceMinutes) || 0);
 
   const data = db.readDB();
   const user = data.users.find(u => u.id === req.user.id);
@@ -312,9 +376,26 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
       });
     }
     user.freeUploadTriesRemaining = Math.max(0, triesLeft - 1);
+  } else {
+    // Paid plan — enforce the monthly source-video minute cap. Checked
+    // (and consumed) after the render completes, same as the free-tier
+    // tries above — this is metering, not a hard pre-flight gate, since
+    // the pipeline doesn't know a source video's length until it's
+    // already been downloaded/uploaded and probed with ffprobe.
+    ensureCurrentPeriod(user);
+    const cap = PLAN_MONTHLY_MINUTES[user.plan];
+    if (cap && user.monthlyMinutesUsed + sourceMinutes > cap) {
+      return res.status(402).json({
+        error: `You've reached your plan's ${cap}-minute monthly limit of source video — upgrade for more, or it resets next month.`,
+        monthlyMinutesUsed: Math.round(user.monthlyMinutesUsed * 10) / 10,
+        monthlyMinutesCap: cap,
+      });
+    }
+    user.monthlyMinutesUsed = Math.round((user.monthlyMinutesUsed + sourceMinutes) * 100) / 100;
   }
 
   user.totalProxyMbUsed = (user.totalProxyMbUsed || 0) + proxyMbUsed;
+  recordDailyUsage(user, { minutes: sourceMinutes, proxyMb: proxyMbUsed });
 
   db.writeDB(data);
   res.json(publicUser(user));
@@ -339,6 +420,35 @@ function requireAdmin(req, res, next){
 
 const PLAN_PRICES = { starter: 19, pro: 49, elite: 129 };
 const PLAN_EST_COST = { starter: 4.90, pro: 15.22, elite: 58.05 };
+
+// Rolls every user's per-day usage log into a single date-sorted table —
+// one row per day across the last `days` days, totaled across all users.
+// Powers the "Daily Usage" tab in the stats Sheet.
+function buildDailyUsageRollup(users, days){
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const byDay = {};
+  for(const u of users){
+    if(!u.dailyUsage) continue;
+    for(const [day, stats] of Object.entries(u.dailyUsage)){
+      if(new Date(`${day}T00:00:00Z`).getTime() < cutoff) continue;
+      const row = byDay[day] || { minutes: 0, proxyMb: 0, jobs: 0, activeUsers: 0 };
+      row.minutes += stats.minutes || 0;
+      row.proxyMb += stats.proxyMb || 0;
+      row.jobs += stats.jobs || 0;
+      row.activeUsers += 1;
+      byDay[day] = row;
+    }
+  }
+  return Object.entries(byDay)
+    .map(([date, row]) => ({
+      date,
+      minutes: Math.round(row.minutes * 10) / 10,
+      proxyMb: Math.round(row.proxyMb * 10) / 10,
+      jobs: row.jobs,
+      activeUsers: row.activeUsers,
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
 
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
   const data = db.readDB();
@@ -371,10 +481,13 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
         plan: u.plan,
         joinedAt: u.createdAt,
         totalProxyMbUsed: Math.round((u.totalProxyMbUsed || 0) * 10) / 10,
+        monthlyMinutesUsed: Math.round(effectiveMonthlyMinutes(u) * 10) / 10,
+        monthlyMinutesCap: PLAN_MONTHLY_MINUTES[u.plan] || null,
       }))
       .sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)),
     byPlan,
     totals,
+    dailyUsage: buildDailyUsageRollup(data.users, 30),
   });
 });
 
