@@ -1,7 +1,7 @@
 {
   "name": "clipsmith-backend",
   "version": "1.0.0",
-  "description": "Stripe checkout + webhook backend for Clipsmith",
+  "description": "Auth + Stripe checkout/webhook backend for ViralCut",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,7 +12,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "express-session": "^1.18.0",
     "stripe": "^16.2.0"
   },
   "devDependencies": {
