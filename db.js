@@ -12,7 +12,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = path.join(__dirname, 'data.json');
+// On Railway, a persistent volume is mounted at /data (see clipsmith-data
+// volume attached to this service) — writing data.json there means it
+// survives redeploys, instead of living on the container's ephemeral disk
+// and getting wiped every time the service rebuilds. Falls back to a local
+// file next to this module when /data doesn't exist (local development,
+// or any environment without the volume mounted).
+const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
+const DB_PATH = path.join(DATA_DIR, 'data.json');
 
 function readDB() {
   if (!fs.existsSync(DB_PATH)) {
