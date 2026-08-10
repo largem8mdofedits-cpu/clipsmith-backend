@@ -175,6 +175,16 @@ const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 
 // extra Stripe API call per usage check.
 const PLAN_MONTHLY_MINUTES = { starter: 150, pro: 500, elite: 2000 };
 
+// Daily cap on AI Images (Gemini) generations per user. Gemini's free
+// tier is ~500 requests/day for the WHOLE site, shared across every
+// user — these per-plan caps exist so one account can't burn the day's
+// entire shared quota and break the tool for everyone else. Free plan
+// isn't listed (0) since AI Images is paid-plans-only already (see
+// tools.html). Groq (content ideas) isn't capped the same way — its
+// free tier is ~14,400 requests/day, high enough that per-user limits
+// aren't worth the complexity yet.
+const PLAN_IMAGE_DAILY_LIMITS = { starter: 5, pro: 10, elite: 20 };
+
 function currentPeriod(){
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; // "2026-08"
@@ -223,6 +233,25 @@ function recordDailyUsage(user, { minutes, proxyMb }){
   }
 }
 
+// Same "reset if the day rolled over" pattern as ensureCurrentPeriod, but
+// for the daily (not monthly) AI Images counter. Mutates in place —
+// caller writes the DB afterward.
+function ensureImageDay(user){
+  const day = todayKey();
+  if(user.imagesDate !== day){
+    user.imagesDate = day;
+    user.imagesUsedToday = 0;
+  }
+}
+
+// Read-only version for publicUser()/admin stats — doesn't mutate, so a
+// stale count from a prior day just reads as 0 instead of actually
+// resetting (only the write path in /api/consume-image-generation does
+// that), same split as effectiveMonthlyMinutes vs ensureCurrentPeriod.
+function effectiveImagesToday(user){
+  return user.imagesDate === todayKey() ? (user.imagesUsedToday || 0) : 0;
+}
+
 function isDisposableEmail(email){
   const domain = (email.split('@')[1] || '').toLowerCase();
   return DISPOSABLE_EMAIL_DOMAINS.has(domain);
@@ -264,6 +293,8 @@ function publicUser(user, includeToken){
     totalProxyMbUsed: user.totalProxyMbUsed || 0,
     monthlyMinutesUsed: Math.round(effectiveMonthlyMinutes(user) * 10) / 10,
     monthlyMinutesCap: PLAN_MONTHLY_MINUTES[user.plan] || null,
+    imagesUsedToday: effectiveImagesToday(user),
+    imagesDailyCap: PLAN_IMAGE_DAILY_LIMITS[user.plan] || null,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -299,6 +330,8 @@ app.post('/api/signup', async (req, res) => {
     usagePeriod: currentPeriod(),
     monthlyMinutesUsed: 0,
     dailyUsage: {},
+    imagesDate: todayKey(),
+    imagesUsedToday: 0,
     signupIp: ip,
     stripeCustomerId: null,
     createdAt: new Date().toISOString(),
@@ -396,6 +429,39 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
 
   user.totalProxyMbUsed = (user.totalProxyMbUsed || 0) + proxyMbUsed;
   recordDailyUsage(user, { minutes: sourceMinutes, proxyMb: proxyMbUsed });
+
+  db.writeDB(data);
+  res.json(publicUser(user));
+});
+
+/**
+ * Records one AI Images (Gemini) generation against the user's daily cap.
+ * Called by tools.html right after a successful /generate-image call to
+ * the pipeline — recorded after the fact (not as a hard pre-flight lock)
+ * same as /api/consume-usage above, so a request that's right at the
+ * boundary doesn't need a second round-trip before the actual generation.
+ * AI Images is paid-plans-only (see tools.html), so free-plan users are
+ * rejected here too, not just client-side.
+ */
+app.post('/api/consume-image-generation', requireAuth, (req, res) => {
+  const data = db.readDB();
+  const user = data.users.find(u => u.id === req.user.id);
+  if (!user) return res.status(401).json({ error: 'Not signed in' });
+
+  if (user.plan === 'free') {
+    return res.status(402).json({ error: 'AI Images requires a paid plan — subscribe to unlock it.' });
+  }
+
+  ensureImageDay(user);
+  const cap = PLAN_IMAGE_DAILY_LIMITS[user.plan] || 0;
+  if (user.imagesUsedToday >= cap) {
+    return res.status(402).json({
+      error: `You've used all ${cap} AI Images generations included in your plan today — it resets tomorrow, or upgrade for more.`,
+      imagesUsedToday: user.imagesUsedToday,
+      imagesDailyCap: cap,
+    });
+  }
+  user.imagesUsedToday += 1;
 
   db.writeDB(data);
   res.json(publicUser(user));
