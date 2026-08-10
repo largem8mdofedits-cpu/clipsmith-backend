@@ -185,6 +185,15 @@ const PLAN_MONTHLY_MINUTES = { starter: 150, pro: 500, elite: 2000 };
 // aren't worth the complexity yet.
 const PLAN_IMAGE_DAILY_LIMITS = { starter: 5, pro: 10, elite: 20 };
 
+// Monthly cap on AI Videos (D-ID talking-avatar) generations per user.
+// D-ID's free tier is only ~5 minutes of video for the WHOLE SITE per
+// month, tracked on D-ID's own dashboard (not something we can read back
+// in real time) — without a per-user cap, one person testing this could
+// burn the entire month's shared budget in a single sitting and leave
+// nothing for anyone else. Starter isn't listed (0) — the budget is too
+// small to split three ways and still be useful to anyone.
+const PLAN_VIDEO_MONTHLY_LIMITS = { pro: 2, elite: 5 };
+
 function currentPeriod(){
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`; // "2026-08"
@@ -252,6 +261,21 @@ function effectiveImagesToday(user){
   return user.imagesDate === todayKey() ? (user.imagesUsedToday || 0) : 0;
 }
 
+// Same reset-on-rollover pattern as ensureCurrentPeriod, but for the
+// monthly AI Videos counter — separate from monthlyMinutesUsed since video
+// generations and source-video minutes are unrelated budgets.
+function ensureVideoMonth(user){
+  const period = currentPeriod();
+  if(user.videosPeriod !== period){
+    user.videosPeriod = period;
+    user.videosUsedThisMonth = 0;
+  }
+}
+
+function effectiveVideosThisMonth(user){
+  return user.videosPeriod === currentPeriod() ? (user.videosUsedThisMonth || 0) : 0;
+}
+
 function isDisposableEmail(email){
   const domain = (email.split('@')[1] || '').toLowerCase();
   return DISPOSABLE_EMAIL_DOMAINS.has(domain);
@@ -295,6 +319,8 @@ function publicUser(user, includeToken){
     monthlyMinutesCap: PLAN_MONTHLY_MINUTES[user.plan] || null,
     imagesUsedToday: effectiveImagesToday(user),
     imagesDailyCap: PLAN_IMAGE_DAILY_LIMITS[user.plan] || null,
+    videosUsedThisMonth: effectiveVideosThisMonth(user),
+    videosMonthlyCap: PLAN_VIDEO_MONTHLY_LIMITS[user.plan] || null,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -462,6 +488,35 @@ app.post('/api/consume-image-generation', requireAuth, (req, res) => {
     });
   }
   user.imagesUsedToday += 1;
+
+  db.writeDB(data);
+  res.json(publicUser(user));
+});
+
+// AI Videos (D-ID) monthly cap — same shape as consume-image-generation
+// above, just monthly instead of daily since D-ID's shared free budget is
+// only ~5 minutes for the whole site per month. Called after a
+// /generate-avatar-video call actually succeeds (see tools.html) so a
+// failed/moderation-rejected attempt doesn't cost the user their quota.
+app.post('/api/consume-video-generation', requireAuth, (req, res) => {
+  const data = db.readDB();
+  const user = data.users.find(u => u.id === req.user.id);
+  if (!user) return res.status(401).json({ error: 'Not signed in' });
+
+  const cap = PLAN_VIDEO_MONTHLY_LIMITS[user.plan] || 0;
+  if (cap === 0) {
+    return res.status(402).json({ error: 'AI Videos requires a Pro or Elite plan — upgrade to unlock it.' });
+  }
+
+  ensureVideoMonth(user);
+  if (user.videosUsedThisMonth >= cap) {
+    return res.status(402).json({
+      error: `You've used all ${cap} AI Videos included in your plan this month — it resets next month, or upgrade for more.`,
+      videosUsedThisMonth: user.videosUsedThisMonth,
+      videosMonthlyCap: cap,
+    });
+  }
+  user.videosUsedThisMonth += 1;
 
   db.writeDB(data);
   res.json(publicUser(user));
