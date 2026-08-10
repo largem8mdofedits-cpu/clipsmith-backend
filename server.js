@@ -200,6 +200,18 @@ const PLAN_PROXY_MB_LIMITS = Object.fromEntries(
 // aren't worth the complexity yet.
 const PLAN_IMAGE_DAILY_LIMITS = { starter: 5, pro: 10, elite: 20 };
 
+// Hard, SITE-WIDE ceiling on Gemini image spend — the per-plan daily caps
+// above only bound what one user can burn; they don't bound the total bill,
+// which scales with however many paying users sign up. This is the number
+// that actually guarantees the monthly Gemini bill can't blow past a fixed
+// dollar amount no matter how much the site grows. $0.039/image is Gemini
+// 2.5 Flash Image's published per-generation rate (Aug 2026). Budget is a
+// Railway env var so it can be raised later as revenue grows, without a
+// code change — defaults to a deliberately conservative $50/month if unset.
+const GEMINI_IMAGE_COST_USD = 0.039;
+const GEMINI_MONTHLY_IMAGE_BUDGET_USD = Number(process.env.GEMINI_MONTHLY_IMAGE_BUDGET_USD) || 50;
+const GEMINI_MONTHLY_IMAGE_CAP = Math.floor(GEMINI_MONTHLY_IMAGE_BUDGET_USD / GEMINI_IMAGE_COST_USD);
+
 // Monthly cap on AI Videos (D-ID talking-avatar) generations per user.
 // D-ID's free tier is only ~5 minutes of video for the WHOLE SITE per
 // month, tracked on D-ID's own dashboard (not something we can read back
@@ -284,6 +296,24 @@ function ensureImageDay(user){
 // that), same split as effectiveMonthlyMinutes vs ensureCurrentPeriod.
 function effectiveImagesToday(user){
   return user.imagesDate === todayKey() ? (user.imagesUsedToday || 0) : 0;
+}
+
+// Site-wide (not per-user) monthly counter backing GEMINI_MONTHLY_IMAGE_CAP
+// above — lives on the root data object since it's a shared pool across
+// every user, not one account's usage. Same reset-on-rollover pattern as
+// the per-user helpers elsewhere in this file.
+function ensureGeminiBudget(data){
+  const period = currentPeriod();
+  if(!data.geminiImageBudget || data.geminiImageBudget.period !== period){
+    data.geminiImageBudget = { period, imagesGenerated: 0 };
+  }
+  return data.geminiImageBudget;
+}
+
+function effectiveGeminiImagesThisMonth(data){
+  return data.geminiImageBudget && data.geminiImageBudget.period === currentPeriod()
+    ? (data.geminiImageBudget.imagesGenerated || 0)
+    : 0;
 }
 
 // Same reset-on-rollover pattern as ensureCurrentPeriod, but for the
@@ -527,7 +557,20 @@ app.post('/api/consume-image-generation', requireAuth, (req, res) => {
       imagesDailyCap: cap,
     });
   }
+
+  // Site-wide hard ceiling — checked after the per-user cap so someone who's
+  // hit their own daily limit sees that message, not this one. This is the
+  // check that actually bounds the total Gemini bill, regardless of how many
+  // paying users are on the site (see GEMINI_MONTHLY_IMAGE_CAP above).
+  const budget = ensureGeminiBudget(data);
+  if (budget.imagesGenerated >= GEMINI_MONTHLY_IMAGE_CAP) {
+    return res.status(429).json({
+      error: `AI Images has hit its site-wide monthly budget cap — it resets on the 1st. This is a cost-safety limit while the site is growing, not a per-user issue.`,
+    });
+  }
+
   user.imagesUsedToday += 1;
+  budget.imagesGenerated += 1;
 
   db.writeDB(data);
   res.json(publicUser(user));
@@ -648,6 +691,16 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   usageTotals.proxyMbRemaining = Math.round((usageTotals.proxyMbCap - usageTotals.proxyMbUsed) * 10) / 10;
   usageTotals.imagesRemainingToday = usageTotals.imagesDailyCap - usageTotals.imagesUsedToday;
   usageTotals.videosRemainingThisMonth = usageTotals.videosMonthlyCap - usageTotals.videosUsedThisMonth;
+
+  // Site-wide Gemini spend ceiling (separate from the per-user daily caps
+  // above) — lets the admin view show at a glance how close the site is to
+  // its hard monthly cost cap, not just each user's own quota.
+  const geminiImagesThisMonth = effectiveGeminiImagesThisMonth(data);
+  usageTotals.geminiImagesUsedThisMonth = geminiImagesThisMonth;
+  usageTotals.geminiImagesMonthlyCap = GEMINI_MONTHLY_IMAGE_CAP;
+  usageTotals.geminiImagesRemainingThisMonth = GEMINI_MONTHLY_IMAGE_CAP - geminiImagesThisMonth;
+  usageTotals.geminiBudgetUsedUsd = Math.round(geminiImagesThisMonth * GEMINI_IMAGE_COST_USD * 100) / 100;
+  usageTotals.geminiBudgetCapUsd = GEMINI_MONTHLY_IMAGE_BUDGET_USD;
 
   res.json({
     generatedAt: new Date().toISOString(),
