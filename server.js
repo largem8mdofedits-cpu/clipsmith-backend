@@ -173,7 +173,10 @@ const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 
 // instead. Resets on the calendar month, not each user's actual Stripe
 // billing date — good enough for a solo-founder-scale app, and avoids an
 // extra Stripe API call per usage check.
-const PLAN_MONTHLY_MINUTES = { starter: 150, pro: 500, elite: 2000 };
+// Repriced Aug 2026 to sit ~15-20% below Crayo's equivalent tiers
+// ($19/$39/$79) while still clearing a healthy margin — see PLAN_PRICES
+// and PLAN_EST_COST below for the profit math this was built against.
+const PLAN_MONTHLY_MINUTES = { starter: 100, pro: 350, elite: 1200 };
 
 // Monthly proxy-bandwidth (Decodo) cap per paid plan, in MB. YouTube-link
 // jobs pull the source video through a paid residential proxy — the
@@ -198,7 +201,7 @@ const PLAN_PROXY_MB_LIMITS = Object.fromEntries(
 // tools.html). Groq (content ideas) isn't capped the same way — its
 // free tier is ~14,400 requests/day, high enough that per-user limits
 // aren't worth the complexity yet.
-const PLAN_IMAGE_DAILY_LIMITS = { starter: 5, pro: 10, elite: 20 };
+const PLAN_IMAGE_DAILY_LIMITS = { starter: 3, pro: 8, elite: 15 };
 
 // Hard, SITE-WIDE ceiling on Gemini image spend — the per-plan daily caps
 // above only bound what one user can burn; they don't bound the total bill,
@@ -219,7 +222,7 @@ const GEMINI_MONTHLY_IMAGE_CAP = Math.floor(GEMINI_MONTHLY_IMAGE_BUDGET_USD / GE
 // burn the entire month's shared budget in a single sitting and leave
 // nothing for anyone else. Starter isn't listed (0) — the budget is too
 // small to split three ways and still be useful to anyone.
-const PLAN_VIDEO_MONTHLY_LIMITS = { pro: 2, elite: 5 };
+const PLAN_VIDEO_MONTHLY_LIMITS = { pro: 1, elite: 3 };
 
 function currentPeriod(){
   const d = new Date();
@@ -622,8 +625,15 @@ function requireAdmin(req, res, next){
   next();
 }
 
-const PLAN_PRICES = { starter: 19, pro: 49, elite: 129 };
-const PLAN_EST_COST = { starter: 4.90, pro: 15.22, elite: 58.05 };
+// Repriced Aug 2026 — ~15-20% under Crayo's $19/$39/$79 equivalent tiers.
+// PLAN_EST_COST = Deepgram ($0.0043/min) + Decodo ($3/GB, 6MB/min) at each
+// plan's full minute cap + Stripe fee (2.9%+$0.30) + ~$1-2 Railway/misc
+// overhead + D-ID video cost at full usage. Does NOT include Gemini Images —
+// that's a flat $50/mo SITE-WIDE cap (see GEMINI_MONTHLY_IMAGE_BUDGET_USD
+// above), not a per-user cost, so it's tracked separately in usageTotals
+// rather than folded into each plan's margin here.
+const PLAN_PRICES = { starter: 16, pro: 34, elite: 69 };
+const PLAN_EST_COST = { starter: 3.95, pro: 11.95, elite: 35.08 };
 
 // Rolls every user's per-day usage log into a single date-sorted table —
 // one row per day across the last `days` days, totaled across all users.
