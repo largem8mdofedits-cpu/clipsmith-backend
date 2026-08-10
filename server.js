@@ -175,6 +175,21 @@ const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 
 // extra Stripe API call per usage check.
 const PLAN_MONTHLY_MINUTES = { starter: 150, pro: 500, elite: 2000 };
 
+// Monthly proxy-bandwidth (Decodo) cap per paid plan, in MB. YouTube-link
+// jobs pull the source video through a paid residential proxy — the
+// minute cap above bounds this indirectly, but a single unusually
+// high-bitrate video could still blow through the proxy budget the profit
+// model assumes without ever hitting the minute cap. This is a direct
+// second gate on the actual cost driver, derived straight from the same
+// assumption the profit model spreadsheet uses (clipsmith_profit_model.xlsx,
+// "Cost Inputs" tab: "Downloaded video size, 1080p source" = 6 MB/minute)
+// applied to each plan's own minute cap — so it lines up with what the
+// pricing was actually built to cover, not an arbitrary number.
+const PROXY_MB_PER_SOURCE_MINUTE = 6;
+const PLAN_PROXY_MB_LIMITS = Object.fromEntries(
+  Object.entries(PLAN_MONTHLY_MINUTES).map(([plan, minutes]) => [plan, minutes * PROXY_MB_PER_SOURCE_MINUTE])
+);
+
 // Daily cap on AI Images (Gemini) generations per user. Gemini's free
 // tier is ~500 requests/day for the WHOLE site, shared across every
 // user — these per-plan caps exist so one account can't burn the day's
@@ -212,6 +227,15 @@ function effectiveMonthlyMinutes(user){
   return user.usagePeriod === currentPeriod() ? (user.monthlyMinutesUsed || 0) : 0;
 }
 
+// Same idea, for the monthly proxy-MB budget (see PLAN_PROXY_MB_LIMITS
+// below) — shares the same usagePeriod/reset as monthlyMinutesUsed since
+// both only apply to YouTube-link jobs and reset on the same monthly
+// cycle. Kept separate from totalProxyMbUsed, which is all-time and never
+// resets (that one's for lifetime reporting, this one's for the cap).
+function effectiveProxyMbThisPeriod(user){
+  return user.usagePeriod === currentPeriod() ? (user.proxyMbUsedThisPeriod || 0) : 0;
+}
+
 // Rolls a user's monthly usage counter over if the calendar month has
 // changed since it was last touched. Mutates in place — caller is
 // responsible for writing the DB afterward. Only called from the write
@@ -221,6 +245,7 @@ function ensureCurrentPeriod(user){
   if(user.usagePeriod !== period){
     user.usagePeriod = period;
     user.monthlyMinutesUsed = 0;
+    user.proxyMbUsedThisPeriod = 0;
   }
 }
 
@@ -315,6 +340,8 @@ function publicUser(user, includeToken){
     plan: user.plan,
     freeUploadTriesRemaining: user.freeUploadTriesRemaining,
     totalProxyMbUsed: user.totalProxyMbUsed || 0,
+    proxyMbUsedThisPeriod: Math.round(effectiveProxyMbThisPeriod(user) * 10) / 10,
+    proxyMbCap: PLAN_PROXY_MB_LIMITS[user.plan] || null,
     monthlyMinutesUsed: Math.round(effectiveMonthlyMinutes(user) * 10) / 10,
     monthlyMinutesCap: PLAN_MONTHLY_MINUTES[user.plan] || null,
     imagesUsedToday: effectiveImagesToday(user),
@@ -436,21 +463,34 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
     }
     user.freeUploadTriesRemaining = Math.max(0, triesLeft - 1);
   } else {
-    // Paid plan — enforce the monthly source-video minute cap. Checked
-    // (and consumed) after the render completes, same as the free-tier
-    // tries above — this is metering, not a hard pre-flight gate, since
-    // the pipeline doesn't know a source video's length until it's
-    // already been downloaded/uploaded and probed with ffprobe.
+    // Paid plan — enforce the monthly source-video minute cap AND the
+    // monthly proxy-MB cap. Both checked (and consumed) after the render
+    // completes, same as the free-tier tries above — this is metering, not
+    // a hard pre-flight gate, since neither a source video's length nor
+    // its actual downloaded size is known until after the job has already
+    // run. The proxy cap exists alongside the minute cap (not instead of
+    // it) because an unusually high-bitrate video can blow the proxy
+    // budget without ever tripping the minute cap — see
+    // PLAN_PROXY_MB_LIMITS above for where the numbers come from.
     ensureCurrentPeriod(user);
-    const cap = PLAN_MONTHLY_MINUTES[user.plan];
-    if (cap && user.monthlyMinutesUsed + sourceMinutes > cap) {
+    const minutesCap = PLAN_MONTHLY_MINUTES[user.plan];
+    if (minutesCap && user.monthlyMinutesUsed + sourceMinutes > minutesCap) {
       return res.status(402).json({
-        error: `You've reached your plan's ${cap}-minute monthly limit of source video — upgrade for more, or it resets next month.`,
+        error: `You've reached your plan's ${minutesCap}-minute monthly limit of source video — upgrade for more, or it resets next month.`,
         monthlyMinutesUsed: Math.round(user.monthlyMinutesUsed * 10) / 10,
-        monthlyMinutesCap: cap,
+        monthlyMinutesCap: minutesCap,
+      });
+    }
+    const proxyCap = PLAN_PROXY_MB_LIMITS[user.plan];
+    if (source === 'youtube' && proxyCap && user.proxyMbUsedThisPeriod + proxyMbUsed > proxyCap) {
+      return res.status(402).json({
+        error: `You've reached your plan's ${proxyCap}MB monthly proxy limit for YouTube-link clipping — upgrade for more, or it resets next month.`,
+        proxyMbUsedThisPeriod: Math.round(user.proxyMbUsedThisPeriod * 10) / 10,
+        proxyMbCap: proxyCap,
       });
     }
     user.monthlyMinutesUsed = Math.round((user.monthlyMinutesUsed + sourceMinutes) * 100) / 100;
+    user.proxyMbUsedThisPeriod = Math.round((user.proxyMbUsedThisPeriod + proxyMbUsed) * 100) / 100;
   }
 
   user.totalProxyMbUsed = (user.totalProxyMbUsed || 0) + proxyMbUsed;
@@ -591,6 +631,24 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
     estMonthlyProfit: acc.estMonthlyProfit + p.estMonthlyProfit,
   }), { mrr: 0, estMonthlyCost: 0, estMonthlyProfit: 0 });
 
+  // Site-wide usage totals — sums each paid user's actual usage against
+  // the total budget their plan allots them, so "how much proxy/images/
+  // video is left across the whole site" is a single glance instead of
+  // scrolling every row of the Paying Users sheet and adding it up by hand.
+  const usageTotals = paidUsers.reduce((acc, u) => {
+    acc.proxyMbUsed += effectiveProxyMbThisPeriod(u);
+    acc.proxyMbCap += PLAN_PROXY_MB_LIMITS[u.plan] || 0;
+    acc.imagesUsedToday += effectiveImagesToday(u);
+    acc.imagesDailyCap += PLAN_IMAGE_DAILY_LIMITS[u.plan] || 0;
+    acc.videosUsedThisMonth += effectiveVideosThisMonth(u);
+    acc.videosMonthlyCap += PLAN_VIDEO_MONTHLY_LIMITS[u.plan] || 0;
+    return acc;
+  }, { proxyMbUsed: 0, proxyMbCap: 0, imagesUsedToday: 0, imagesDailyCap: 0, videosUsedThisMonth: 0, videosMonthlyCap: 0 });
+  usageTotals.proxyMbUsed = Math.round(usageTotals.proxyMbUsed * 10) / 10;
+  usageTotals.proxyMbRemaining = Math.round((usageTotals.proxyMbCap - usageTotals.proxyMbUsed) * 10) / 10;
+  usageTotals.imagesRemainingToday = usageTotals.imagesDailyCap - usageTotals.imagesUsedToday;
+  usageTotals.videosRemainingThisMonth = usageTotals.videosMonthlyCap - usageTotals.videosUsedThisMonth;
+
   res.json({
     generatedAt: new Date().toISOString(),
     totalUsers: data.users.length,
@@ -602,12 +660,19 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
         plan: u.plan,
         joinedAt: u.createdAt,
         totalProxyMbUsed: Math.round((u.totalProxyMbUsed || 0) * 10) / 10,
+        proxyMbUsedThisPeriod: Math.round(effectiveProxyMbThisPeriod(u) * 10) / 10,
+        proxyMbCap: PLAN_PROXY_MB_LIMITS[u.plan] || null,
         monthlyMinutesUsed: Math.round(effectiveMonthlyMinutes(u) * 10) / 10,
         monthlyMinutesCap: PLAN_MONTHLY_MINUTES[u.plan] || null,
+        imagesUsedToday: effectiveImagesToday(u),
+        imagesDailyCap: PLAN_IMAGE_DAILY_LIMITS[u.plan] || null,
+        videosUsedThisMonth: effectiveVideosThisMonth(u),
+        videosMonthlyCap: PLAN_VIDEO_MONTHLY_LIMITS[u.plan] || null,
       }))
       .sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)),
     byPlan,
     totals,
+    usageTotals,
     dailyUsage: buildDailyUsageRollup(data.users, 30),
   });
 });
