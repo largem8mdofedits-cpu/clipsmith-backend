@@ -557,6 +557,31 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   });
 });
 
+// Manual plan override — for comping/testing an account without a real
+// Stripe checkout (e.g. the founder testing their own paid-tier features).
+// Gated by its own secret (SET_PLAN_KEY) rather than ADMIN_KEY so it can be
+// handed out narrowly. GET (not POST) is deliberate here: this is meant to
+// be triggered by opening a link, same as /api/admin/stats already is.
+app.get('/api/admin/set-plan', (req, res) => {
+  const key = req.query.key;
+  if (!process.env.SET_PLAN_KEY || key !== process.env.SET_PLAN_KEY) {
+    return res.status(401).json({ error: 'Not authorized' });
+  }
+  const email = (req.query.email || '').toLowerCase();
+  const plan = req.query.plan;
+  if (!['free', 'starter', 'pro', 'elite'].includes(plan)) {
+    return res.status(400).json({ error: 'plan must be one of free|starter|pro|elite' });
+  }
+  const data = db.readDB();
+  const user = data.users.find(u => u.email.toLowerCase() === email);
+  if (!user) {
+    return res.status(404).json({ error: `No account found for ${email}` });
+  }
+  user.plan = plan;
+  db.writeDB(data);
+  res.json({ ok: true, email: user.email, plan: user.plan });
+});
+
 // Map (plan + billing period) -> the Stripe Price ID you create in the Dashboard.
 const PRICE_IDS = {
   starter_monthly: process.env.PRICE_STARTER_MONTHLY,
