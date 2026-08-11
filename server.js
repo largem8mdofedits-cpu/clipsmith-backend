@@ -136,14 +136,16 @@ function issueToken(user){
   return user.authToken;
 }
 
-// Free plan: uploads only, one-time signup bonus (NOT a recurring
-// refill — same reasoning as before, a recurring allowance makes
-// multi-accounting far more worth the effort). Uploads never touch the
-// residential proxy, so they cost almost nothing to give away. YouTube-
-// link clipping DOES pull bandwidth through the paid proxy, so it's
-// gated to paid plans only — see /api/consume-usage below, there's no
-// free amount of that which is cheap enough to hand out.
-const FREE_UPLOAD_TRIES = 10;
+// Free plan: uploads only, RECURRING every 4 days (not a one-time signup
+// bonus anymore) — 10 uploads, then it refills 4 days after the window
+// started. Cheap to offer this generously since uploads never touch the
+// paid residential proxy (just Deepgram transcription + render compute).
+// YouTube-link pasting stays paid-plans-only regardless of plan or window —
+// see /api/consume-usage below, that's the one that actually costs real
+// money per job and free users are rejected outright for it, no tries
+// consumed either way.
+const FREE_UPLOAD_LIMIT_PER_WINDOW = 10;
+const FREE_UPLOAD_WINDOW_MS = 4 * 24 * 60 * 60 * 1000; // 4 days
 
 // Very small, dependency-free anti-abuse layer for the free-tier signup
 // bonus. Two independent checks, both best-effort (this is a single-
@@ -153,7 +155,8 @@ const FREE_UPLOAD_TRIES = 10;
 //      more than a couple of free accounts from the same connection.
 // Neither is bulletproof (VPNs, mobile carrier NAT, etc. all exist), but
 // together they raise the cost of farming free accounts well above what
-// a casual abuser will bother with.
+// a casual abuser will bother with. Worth even more now that the free
+// upload allowance recurs every 4 days instead of being a one-time thing.
 const DISPOSABLE_EMAIL_DOMAINS = new Set([
   'mailinator.com', 'guerrillamail.com', 'guerrillamail.info', '10minutemail.com',
   '10minutemail.net', 'tempmail.com', 'temp-mail.org', 'throwawaymail.com',
@@ -169,10 +172,10 @@ const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 
 // pricing page ("150 min of source video / month" etc). Applies to total
 // source video processed (uploads AND YouTube links both count — the cap
 // exists because of transcription/render cost, not just proxy bandwidth).
-// Free plan has no minute cap; it's limited by freeUploadTriesRemaining
-// instead. Resets on the calendar month, not each user's actual Stripe
-// billing date — good enough for a solo-founder-scale app, and avoids an
-// extra Stripe API call per usage check.
+// Free plan has no minute cap; it's limited by the recurring free-upload
+// window instead. Resets on the calendar month, not each user's actual
+// Stripe billing date — good enough for a solo-founder-scale app, and
+// avoids an extra Stripe API call per usage check.
 // Repriced Aug 2026 to sit ~15-20% below Crayo's equivalent tiers
 // ($19/$39/$79) while still clearing a healthy margin — see PLAN_PRICES
 // and PLAN_EST_COST below for the profit math this was built against.
@@ -262,6 +265,38 @@ function ensureCurrentPeriod(user){
     user.monthlyMinutesUsed = 0;
     user.proxyMbUsedThisPeriod = 0;
   }
+}
+
+// Rolling 4-day window for the free plan's recurring upload allowance.
+// Mutates in place — caller writes the DB afterward. A missing
+// freeUploadWindowStart (legacy accounts from before this became
+// recurring, or a fresh signup) just starts a brand-new window now.
+function ensureFreeUploadWindow(user){
+  const now = Date.now();
+  const startedAt = user.freeUploadWindowStart ? new Date(user.freeUploadWindowStart).getTime() : 0;
+  if (!user.freeUploadWindowStart || now - startedAt >= FREE_UPLOAD_WINDOW_MS) {
+    user.freeUploadWindowStart = new Date().toISOString();
+    user.freeUploadsUsedInWindow = 0;
+  }
+}
+
+// Read-only version for publicUser() — doesn't mutate, so a stale/expired
+// window just reads as "fully refilled" instead of actually rolling over
+// (only the write path in /api/consume-usage does that), same split as
+// effectiveMonthlyMinutes vs ensureCurrentPeriod above.
+function effectiveFreeUploadsRemaining(user){
+  const now = Date.now();
+  const startedAt = user.freeUploadWindowStart ? new Date(user.freeUploadWindowStart).getTime() : 0;
+  const expired = !user.freeUploadWindowStart || now - startedAt >= FREE_UPLOAD_WINDOW_MS;
+  const used = expired ? 0 : (user.freeUploadsUsedInWindow || 0);
+  return Math.max(0, FREE_UPLOAD_LIMIT_PER_WINDOW - used);
+}
+
+// When the current window refills, for the frontend to show "resets in
+// X" messaging. Read-only, same non-mutating shape as the helper above.
+function freeUploadWindowResetAt(user){
+  const startedAt = user.freeUploadWindowStart ? new Date(user.freeUploadWindowStart).getTime() : Date.now();
+  return new Date(startedAt + FREE_UPLOAD_WINDOW_MS).toISOString();
 }
 
 // Lightweight per-day usage log, kept per user for the last 90 days —
@@ -371,7 +406,11 @@ function publicUser(user, includeToken){
     id: user.id,
     email: user.email,
     plan: user.plan,
-    freeUploadTriesRemaining: user.freeUploadTriesRemaining,
+    // Field name kept as freeUploadTriesRemaining for frontend compat —
+    // the underlying meaning changed from a one-time pool to a recurring
+    // 4-day window (see effectiveFreeUploadsRemaining above).
+    freeUploadTriesRemaining: effectiveFreeUploadsRemaining(user),
+    freeUploadWindowResetAt: user.plan === 'free' ? freeUploadWindowResetAt(user) : null,
     totalProxyMbUsed: user.totalProxyMbUsed || 0,
     proxyMbUsedThisPeriod: Math.round(effectiveProxyMbThisPeriod(user) * 10) / 10,
     proxyMbCap: PLAN_PROXY_MB_LIMITS[user.plan] || null,
@@ -411,7 +450,8 @@ app.post('/api/signup', async (req, res) => {
     email,
     passwordHash,
     plan: 'free',
-    freeUploadTriesRemaining: FREE_UPLOAD_TRIES,
+    freeUploadWindowStart: new Date().toISOString(),
+    freeUploadsUsedInWindow: 0,
     totalProxyMbUsed: 0,
     usagePeriod: currentPeriod(),
     monthlyMinutesUsed: 0,
@@ -461,10 +501,11 @@ app.get('/api/me', requireAuth, (req, res) => {
  * Records usage after a completed render and enforces plan limits.
  *
  * source: 'upload' | 'youtube'. Uploads never touch the proxy, so free-
- * plan users get a limited number of one-time free upload tries.
- * YouTube-link jobs always pull bandwidth through the paid residential
- * proxy, so they're paid-plans-only — free users are rejected outright,
- * no tries consumed either way.
+ * plan users get a recurring allowance (10 every 4 days — see
+ * FREE_UPLOAD_LIMIT_PER_WINDOW above). YouTube-link jobs always pull
+ * bandwidth through the paid residential proxy, so they're paid-plans-only
+ * regardless of plan or window — free users are rejected outright, no
+ * uploads consumed either way.
  *
  * proxyMbUsed: how much bandwidth THIS job pulled through the proxy (0
  * for uploads, the downloaded source video's size for YouTube links).
@@ -487,19 +528,21 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
   }
 
   if (user.plan === 'free') {
-    const triesLeft = user.freeUploadTriesRemaining ?? 0;
-    if (triesLeft <= 0) {
+    ensureFreeUploadWindow(user);
+    const used = user.freeUploadsUsedInWindow || 0;
+    if (used >= FREE_UPLOAD_LIMIT_PER_WINDOW) {
       return res.status(402).json({
-        error: 'Your free uploads are used up — subscribe to keep rendering.',
+        error: `You've used all ${FREE_UPLOAD_LIMIT_PER_WINDOW} free uploads for this 4-day window — it refills ${freeUploadWindowResetAt(user)}, or subscribe for unlimited uploads plus YouTube-link clipping.`,
         freeUploadTriesRemaining: 0,
+        freeUploadWindowResetAt: freeUploadWindowResetAt(user),
       });
     }
-    user.freeUploadTriesRemaining = Math.max(0, triesLeft - 1);
+    user.freeUploadsUsedInWindow = used + 1;
   } else {
     // Paid plan — enforce the monthly source-video minute cap AND the
     // monthly proxy-MB cap. Both checked (and consumed) after the render
-    // completes, same as the free-tier tries above — this is metering, not
-    // a hard pre-flight gate, since neither a source video's length nor
+    // completes, same as the free-tier allowance above — this is metering,
+    // not a hard pre-flight gate, since neither a source video's length nor
     // its actual downloaded size is known until after the job has already
     // run. The proxy cap exists alongside the minute cap (not instead of
     // it) because an unusually high-bitrate video can blow the proxy
