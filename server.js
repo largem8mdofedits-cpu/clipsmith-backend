@@ -310,6 +310,117 @@ function buildReferralBonusEmailHtml(referrer, bonusUploads){
     </div>`;
 }
 
+// ---------------------------------------------------------------------------
+// Automated nudge emails — a small, low-frequency retention loop, not a full
+// drip-campaign builder. Two segments, each capped to one send per user per
+// cooldown so nobody gets hammered:
+//
+//   1. "Activation" — verified their email, never rendered a single clip.
+//      Sent once, ever, a couple days after signup (activationNudgeSent
+//      flag prevents repeats).
+//   2. "Unused free uploads" — free plan, HAS used the product before, but
+//      gone quiet with free uploads still sitting unused this window.
+//      Repeatable, but throttled by NUDGE_COOLDOWN_MS.
+//
+// Gated on marketingOptIn (same consent bucket as campaign sends) since
+// these are retention/growth emails, not required for the account to work —
+// unverified or opted-out users are never touched. Every send carries the
+// same unsubscribe footer as a campaign email.
+// ---------------------------------------------------------------------------
+const NUDGE_MIN_ACCOUNT_AGE_MS = 2 * 24 * 60 * 60 * 1000; // don't nudge same-day signups
+const NUDGE_STALE_ACTIVITY_MS = 3 * 24 * 60 * 60 * 1000;  // "gone quiet" threshold
+const NUDGE_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000;        // min gap between nudges to the same user
+const NUDGE_RUN_HOUR_UTC = Number(process.env.NUDGE_RUN_HOUR_UTC) || 15; // ~late morning US
+const NUDGE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // check hourly whether it's time to run today's batch
+
+function lastActivityAt(user){
+  if(!user.dailyUsage) return null;
+  const days = Object.keys(user.dailyUsage);
+  if(!days.length) return null;
+  return new Date(`${days.sort().slice(-1)[0]}T00:00:00Z`).getTime();
+}
+
+function buildActivationNudgeEmailHtml(user){
+  const link = `${(process.env.CLIENT_URL || '').replace(/\/$/, '')}/#editor`;
+  return `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;color:#222;">
+      <h2 style="margin-bottom:4px;">Your first clip is waiting</h2>
+      <p style="color:#555;">You verified your ViralCut account but haven't made a clip yet — you've got ${effectiveFreeUploadsRemaining(user)} free uploads sitting unused, no card required.</p>
+      <p><a href="${link}" style="display:inline-block;padding:12px 22px;background:#6c6cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;">Make your first clip</a></p>
+    </div>`;
+}
+
+function buildUnusedUploadsNudgeEmailHtml(user){
+  const remaining = effectiveFreeUploadsRemaining(user);
+  const link = `${(process.env.CLIENT_URL || '').replace(/\/$/, '')}/#editor`;
+  return `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;color:#222;">
+      <h2 style="margin-bottom:4px;">You've still got ${remaining} free ${remaining === 1 ? 'upload' : 'uploads'} this window</h2>
+      <p style="color:#555;">They reset on a rolling 4-day window whether you use them or not — come cut a few more clips.</p>
+      <p><a href="${link}" style="display:inline-block;padding:12px 22px;background:#6c6cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;">Open the editor</a></p>
+    </div>`;
+}
+
+async function sendNudgeEmails(){
+  const data = db.readDB();
+  const now = Date.now();
+  let activationSent = 0, unusedSent = 0;
+
+  for(const user of data.users){
+    if(!user.emailVerified || !user.marketingOptIn) continue;
+    if(!user.unsubscribeToken) user.unsubscribeToken = crypto.randomBytes(16).toString('hex'); // backfill for pre-existing accounts
+
+    const accountAge = now - new Date(user.createdAt).getTime();
+    if(accountAge < NUDGE_MIN_ACCOUNT_AGE_MS) continue;
+
+    const lastNudge = user.lastNudgeSentAt ? new Date(user.lastNudgeSentAt).getTime() : 0;
+    if(now - lastNudge < NUDGE_COOLDOWN_MS) continue;
+
+    const lastActivity = lastActivityAt(user);
+
+    if(!lastActivity && !user.activationNudgeSent){
+      const sent = await sendEmail(user.email, 'Your first ViralCut clip is waiting', appendUnsubscribeFooter(buildActivationNudgeEmailHtml(user), user));
+      if(sent){ user.activationNudgeSent = true; user.lastNudgeSentAt = new Date().toISOString(); activationSent++; }
+      continue;
+    }
+
+    if(user.plan === 'free' && lastActivity && (now - lastActivity) >= NUDGE_STALE_ACTIVITY_MS){
+      const remaining = effectiveFreeUploadsRemaining(user);
+      if(remaining > 0){
+        const sent = await sendEmail(user.email, `You've still got ${remaining} free uploads this window`, appendUnsubscribeFooter(buildUnusedUploadsNudgeEmailHtml(user), user));
+        if(sent){ user.lastNudgeSentAt = new Date().toISOString(); unusedSent++; }
+      }
+    }
+  }
+
+  data.totalNudgeEmailsSent = (data.totalNudgeEmailsSent || 0) + activationSent + unusedSent;
+  db.writeDB(data);
+  console.log(`[nudge] Sent ${activationSent} activation + ${unusedSent} unused-uploads nudge${(activationSent + unusedSent) === 1 ? '' : 's'}.`);
+  return { activationSent, unusedSent };
+}
+
+// In-process daily scheduler — deliberately not a separate Railway cron
+// service or an npm cron package, to avoid adding infra/dependencies for
+// something this simple. Checks once an hour whether it's the configured
+// hour AND today hasn't run yet (tracked in the DB so a redeploy/restart
+// mid-day doesn't cause a duplicate run). Only fires while this service is
+// actually running — if you ever put clipsmith-backend to sleep on
+// inactivity, the daily check just resumes on the next hourly tick after it
+// wakes, it won't backfill missed days.
+setInterval(async () => {
+  if(new Date().getUTCHours() !== NUDGE_RUN_HOUR_UTC) return;
+  const data = db.readDB();
+  const today = todayKey();
+  if(data.lastNudgeRunDate === today) return;
+  data.lastNudgeRunDate = today;
+  db.writeDB(data);
+  try{
+    await sendNudgeEmails();
+  }catch(err){
+    console.error('[nudge] Daily run failed:', err.message);
+  }
+}, NUDGE_CHECK_INTERVAL_MS);
+
 // Monthly source-video minute caps per paid plan — mirrors the copy on the
 // pricing page ("150 min of source video / month" etc). Applies to total
 // source video processed (uploads AND YouTube links both count — the cap
@@ -1124,6 +1235,7 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   usageTotals.verifiedUsers = data.users.filter(u => u.emailVerified).length;
   usageTotals.unverifiedUsers = data.users.length - usageTotals.verifiedUsers;
   usageTotals.marketingOptInUsers = data.users.filter(u => u.marketingOptIn).length;
+  usageTotals.totalNudgeEmailsSent = data.totalNudgeEmailsSent || 0;
 
   // totals.estMonthlyProfit only nets out each plan's own per-user variable
   // cost (PLAN_EST_COST) — it doesn't touch the SHARED site-wide budgets
@@ -1198,6 +1310,20 @@ app.post('/api/admin/send-campaign', requireAdmin, async (req, res) => {
   }));
   const result = await sendCampaignBatch(items);
   res.json({ ok: true, audience: audience.length, ...result });
+});
+
+// Manual trigger for the nudge job — lets you test it right after deploying
+// without waiting for NUDGE_RUN_HOUR_UTC, or force a batch out on demand.
+// Safe to call repeatedly: every per-user cooldown/dedupe check in
+// sendNudgeEmails still applies, so calling this twice in a row just no-ops
+// the second time for anyone already nudged.
+app.post('/api/admin/run-nudge-check', requireAdmin, async (req, res) => {
+  try{
+    const result = await sendNudgeEmails();
+    res.json({ ok: true, ...result });
+  }catch(err){
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Manual plan override — for comping/testing an account without a real
