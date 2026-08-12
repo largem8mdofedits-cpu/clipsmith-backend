@@ -192,9 +192,34 @@ const PLAN_MONTHLY_MINUTES = { starter: 100, pro: 350, elite: 1200 };
 // applied to each plan's own minute cap — so it lines up with what the
 // pricing was actually built to cover, not an arbitrary number.
 const PROXY_MB_PER_SOURCE_MINUTE = 6;
+
+// The pipeline now caches a downloaded source video by URL for 24h (see
+// SOURCE_CACHE_DIR in pipeline.py) and tries a free/self-hosted proxy tier
+// before ever touching the paid one — both cut REAL proxy spend well below
+// the naive "every minute costs 6MB" assumption above. PROXY_CACHE_SAVINGS_
+// FACTOR is a conservative estimate of that reduction (0.6 = expect actual
+// usage to run ~40% below the uncached full-price number), applied to both
+// the per-plan proxy cap and the Decodo line item in PLAN_EST_COST below.
+// This is a placeholder until there's real usage data — tighten or relax it
+// once /api/admin/stats has a few months of actual proxyMb numbers to look at.
+const PROXY_CACHE_SAVINGS_FACTOR = 0.6;
 const PLAN_PROXY_MB_LIMITS = Object.fromEntries(
-  Object.entries(PLAN_MONTHLY_MINUTES).map(([plan, minutes]) => [plan, minutes * PROXY_MB_PER_SOURCE_MINUTE])
+  Object.entries(PLAN_MONTHLY_MINUTES).map(([plan, minutes]) => [
+    plan,
+    Math.round(minutes * PROXY_MB_PER_SOURCE_MINUTE * PROXY_CACHE_SAVINGS_FACTOR),
+  ])
 );
+
+// Site-wide (not per-user) monthly ceiling on actual Decodo/proxy spend —
+// same "hard dollar cap regardless of how many users sign up" pattern as
+// GEMINI_MONTHLY_IMAGE_BUDGET_USD below. The per-plan MB caps above bound
+// what one user can burn; this bounds the total bill. $3.00/GB mirrors the
+// profit-model spreadsheet's Decodo rate. Defaults conservative ($40/mo)
+// until real usage data justifies raising it — set PROXY_MONTHLY_BUDGET_USD
+// in Railway to override.
+const DECODO_COST_PER_GB_USD = 3.0;
+const PROXY_MONTHLY_BUDGET_USD = Number(process.env.PROXY_MONTHLY_BUDGET_USD) || 40;
+const PROXY_MONTHLY_MB_CAP_SITEWIDE = (PROXY_MONTHLY_BUDGET_USD / DECODO_COST_PER_GB_USD) * 1024;
 
 // Daily cap on AI Images (Gemini) generations per user. Gemini's free
 // tier is ~500 requests/day for the WHOLE site, shared across every
@@ -351,6 +376,25 @@ function ensureGeminiBudget(data){
 function effectiveGeminiImagesThisMonth(data){
   return data.geminiImageBudget && data.geminiImageBudget.period === currentPeriod()
     ? (data.geminiImageBudget.imagesGenerated || 0)
+    : 0;
+}
+
+// Site-wide monthly proxy-spend circuit breaker — same shape as the Gemini
+// budget above, backing PROXY_MONTHLY_MB_CAP_SITEWIDE. This is the one check
+// that actually bounds the total Decodo bill regardless of how many paid
+// users sign up or how the per-plan caps are tuned; the per-plan MB limits
+// only bound what ONE user can burn.
+function ensureProxyBudget(data){
+  const period = currentPeriod();
+  if(!data.proxyBudget || data.proxyBudget.period !== period){
+    data.proxyBudget = { period, mbUsed: 0 };
+  }
+  return data.proxyBudget;
+}
+
+function effectiveProxyMbThisMonthSitewide(data){
+  return data.proxyBudget && data.proxyBudget.period === currentPeriod()
+    ? (data.proxyBudget.mbUsed || 0)
     : 0;
 }
 
@@ -565,6 +609,20 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
         proxyMbCap: proxyCap,
       });
     }
+    // Site-wide circuit breaker — checked after the per-user cap so someone
+    // who's already hit their own limit sees that message, not this one.
+    // This is the one check that bounds the TOTAL Decodo bill no matter how
+    // many paid users are active this month (see PROXY_MONTHLY_MB_CAP_
+    // SITEWIDE above).
+    if (source === 'youtube' && proxyMbUsed > 0) {
+      const proxyBudget = ensureProxyBudget(data);
+      if (proxyBudget.mbUsed + proxyMbUsed > PROXY_MONTHLY_MB_CAP_SITEWIDE) {
+        return res.status(429).json({
+          error: `YouTube-link clipping has hit its site-wide monthly proxy budget — it resets on the 1st. This is a cost-safety limit while the site is growing, not a per-user issue. Uploading your own video still works normally.`,
+        });
+      }
+      proxyBudget.mbUsed = Math.round((proxyBudget.mbUsed + proxyMbUsed) * 100) / 100;
+    }
     user.monthlyMinutesUsed = Math.round((user.monthlyMinutesUsed + sourceMinutes) * 100) / 100;
     user.proxyMbUsedThisPeriod = Math.round((user.proxyMbUsedThisPeriod + proxyMbUsed) * 100) / 100;
   }
@@ -676,7 +734,22 @@ function requireAdmin(req, res, next){
 // above), not a per-user cost, so it's tracked separately in usageTotals
 // rather than folded into each plan's margin here.
 const PLAN_PRICES = { starter: 16, pro: 34, elite: 69 };
-const PLAN_EST_COST = { starter: 3.95, pro: 11.95, elite: 35.08 };
+
+// PLAN_EST_COST_FULL_PRICE is the original estimate (Deepgram + Decodo AT
+// FULL, UNCACHED PRICE + Stripe fee + Railway/misc + D-ID), from before the
+// pipeline had a source-video cache or a free-proxy-tier fallback. Actual
+// PLAN_EST_COST below subtracts however much of that original Decodo line
+// item PROXY_CACHE_SAVINGS_FACTOR (above) says should now be saved — so the
+// admin profit numbers reflect the real infra, not the pre-caching estimate.
+const PLAN_EST_COST_FULL_PRICE = { starter: 3.95, pro: 11.95, elite: 35.08 };
+const PLAN_EST_COST = Object.fromEntries(
+  Object.entries(PLAN_EST_COST_FULL_PRICE).map(([plan, fullCost]) => {
+    const fullDecodoMb = PLAN_MONTHLY_MINUTES[plan] * PROXY_MB_PER_SOURCE_MINUTE;
+    const fullDecodoCostUsd = (fullDecodoMb / 1024) * DECODO_COST_PER_GB_USD;
+    const savedUsd = fullDecodoCostUsd * (1 - PROXY_CACHE_SAVINGS_FACTOR);
+    return [plan, Math.round((fullCost - savedUsd) * 100) / 100];
+  })
+);
 
 // Rolls every user's per-day usage log into a single date-sorted table —
 // one row per day across the last `days` days, totaled across all users.
@@ -755,6 +828,26 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   usageTotals.geminiBudgetUsedUsd = Math.round(geminiImagesThisMonth * GEMINI_IMAGE_COST_USD * 100) / 100;
   usageTotals.geminiBudgetCapUsd = GEMINI_MONTHLY_IMAGE_BUDGET_USD;
 
+  // Site-wide proxy spend circuit breaker (see PROXY_MONTHLY_MB_CAP_SITEWIDE
+  // above) — same shape as the Gemini budget fields, so the admin view shows
+  // both hard cost ceilings at a glance.
+  const proxyMbThisMonthSitewide = effectiveProxyMbThisMonthSitewide(data);
+  usageTotals.proxyBudgetUsedUsd = Math.round((proxyMbThisMonthSitewide / 1024) * DECODO_COST_PER_GB_USD * 100) / 100;
+  usageTotals.proxyBudgetCapUsd = PROXY_MONTHLY_BUDGET_USD;
+  usageTotals.proxyBudgetMbUsedThisMonth = Math.round(proxyMbThisMonthSitewide * 10) / 10;
+  usageTotals.proxyBudgetMbCapThisMonth = Math.round(PROXY_MONTHLY_MB_CAP_SITEWIDE * 10) / 10;
+
+  // totals.estMonthlyProfit only nets out each plan's own per-user variable
+  // cost (PLAN_EST_COST) — it doesn't touch the SHARED site-wide budgets
+  // (Gemini Images, proxy), which are real spend but aren't attributed to
+  // any one plan. netEstMonthlyProfit is the more honest "what's actually
+  // left over" number: gross MRR, minus per-user variable costs, minus
+  // this month's ACTUAL shared spend (not the cap — actual usage, so this
+  // stays accurate even on a month nobody maxes either budget out).
+  const netEstMonthlyProfit = Math.round(
+    (totals.estMonthlyProfit - usageTotals.geminiBudgetUsedUsd - usageTotals.proxyBudgetUsedUsd) * 100
+  ) / 100;
+
   res.json({
     generatedAt: new Date().toISOString(),
     totalUsers: data.users.length,
@@ -777,7 +870,7 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
       }))
       .sort((a, b) => new Date(b.joinedAt) - new Date(a.joinedAt)),
     byPlan,
-    totals,
+    totals: { ...totals, netEstMonthlyProfit },
     usageTotals,
     dailyUsage: buildDailyUsageRollup(data.users, 30),
   });
