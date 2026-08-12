@@ -168,6 +168,72 @@ const DISPOSABLE_EMAIL_DOMAINS = new Set([
 const SIGNUPS_PER_IP_LIMIT = 2;      // max free-tier signups from one IP...
 const SIGNUPS_PER_IP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // ...per rolling 30 days
 
+// ---------------------------------------------------------------------------
+// Email verification + marketing opt-in.
+//
+// Free-tier signup previously required nothing but any string with an "@" in
+// it, so anyone could type a random unowned address and start burning the
+// free-upload allowance. Every new account now gets a one-time verify link
+// (24h expiry) mailed to the address they gave; free-plan usage is blocked
+// until they click it (see the emailVerified check in /api/consume-usage).
+// Paid accounts already prove address ownership indirectly via Stripe/card
+// billing, so the gate below only applies to the free plan.
+//
+// Sends via Resend (resend.com) — 3,000 free emails/month, no card needed.
+// Set RESEND_API_KEY in Railway to activate; if it's unset, sendEmail()
+// just logs and skips instead of throwing, so signup still works end-to-end
+// without a provider configured (verification just can't complete until one
+// is). Set RESEND_FROM_EMAIL once you've verified a domain in Resend — until
+// then the default onboarding@resend.dev sender only delivers to the email
+// address on the Resend account itself (Resend's anti-abuse restriction for
+// unverified domains), which is fine for testing but not for real users.
+// ---------------------------------------------------------------------------
+const EMAIL_VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const VERIFICATION_EMAIL_MIN_INTERVAL_MS = 2 * 60 * 1000; // resend throttle
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'ViralCut <onboarding@resend.dev>';
+// Base URL the verify link points back to (this backend, not the frontend —
+// it does the verify + redirect). RAILWAY_PUBLIC_DOMAIN is auto-injected by
+// Railway for every service; API_URL overrides it if you're on a custom
+// domain or running locally.
+const API_BASE_URL = (process.env.API_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${process.env.PORT || 4242}`)).replace(/\/$/, '');
+
+async function sendEmail(to, subject, html){
+  if(!RESEND_API_KEY){
+    console.log(`[email] RESEND_API_KEY not set — skipping send to ${to}: "${subject}"`);
+    return false;
+  }
+  try{
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: RESEND_FROM_EMAIL, to, subject, html }),
+    });
+    if(!resp.ok){
+      const errText = await resp.text().catch(() => '');
+      console.error(`[email] Resend API error (${resp.status}) sending to ${to}: ${errText}`);
+      return false;
+    }
+    return true;
+  }catch(err){
+    console.error(`[email] Failed to send to ${to}:`, err.message);
+    return false;
+  }
+}
+
+function buildVerifyEmailHtml(user){
+  const link = `${API_BASE_URL}/api/verify-email?token=${user.emailVerifyToken}`;
+  return `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;color:#222;">
+      <h2 style="margin-bottom:4px;">Verify your email</h2>
+      <p style="color:#555;">Confirm this address to unlock your free uploads on ViralCut.</p>
+      <p><a href="${link}" style="display:inline-block;padding:12px 22px;background:#6c6cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;">Verify email</a></p>
+      <p style="color:#888;font-size:13px;">Or paste this link into your browser:<br>${link}</p>
+      <p style="color:#888;font-size:13px;">This link expires in 24 hours.</p>
+    </div>`;
+}
+
 // Monthly source-video minute caps per paid plan — mirrors the copy on the
 // pricing page ("150 min of source video / month" etc). Applies to total
 // source video processed (uploads AND YouTube links both count — the cap
@@ -464,6 +530,8 @@ function publicUser(user, includeToken){
     imagesDailyCap: PLAN_IMAGE_DAILY_LIMITS[user.plan] || null,
     videosUsedThisMonth: effectiveVideosThisMonth(user),
     videosMonthlyCap: PLAN_VIDEO_MONTHLY_LIMITS[user.plan] || null,
+    emailVerified: !!user.emailVerified,
+    marketingOptIn: !!user.marketingOptIn,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -471,7 +539,7 @@ function publicUser(user, includeToken){
 }
 
 app.post('/api/signup', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, marketingOptIn } = req.body;
   if(!email || !password || password.length < 8){
     return res.status(400).json({ error: 'Enter a valid email and a password with at least 8 characters' });
   }
@@ -504,13 +572,76 @@ app.post('/api/signup', async (req, res) => {
     imagesUsedToday: 0,
     signupIp: ip,
     stripeCustomerId: null,
+    // Opt-in defaults to false (unchecked on the signup form) — genuine
+    // opt-in rather than a pre-checked box, for GDPR/CAN-SPAM hygiene.
+    marketingOptIn: !!marketingOptIn,
+    emailVerified: false,
+    emailVerifyToken: crypto.randomBytes(32).toString('hex'),
+    emailVerifyTokenExpiresAt: new Date(Date.now() + EMAIL_VERIFY_TOKEN_TTL_MS).toISOString(),
+    lastVerificationEmailSentAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
   };
   issueToken(user);
   data.users.push(user);
   db.writeDB(data);
 
+  // Best-effort — a slow/failed email provider should never block signup
+  // itself. sendEmail() already swallows its own errors and logs them.
+  await sendEmail(user.email, 'Verify your ViralCut email', buildVerifyEmailHtml(user));
+
   res.json(publicUser(user, true));
+});
+
+// Triggered by the link in the verification email — GET, not POST, since
+// it's meant to be opened directly from an inbox (same pattern already used
+// by /api/admin/set-plan below). Redirects back to the frontend with a
+// ?verified= flag so index.html can show a toast; falls back to plain JSON
+// if CLIENT_URL isn't set.
+app.get('/api/verify-email', (req, res) => {
+  const redirectBase = (process.env.CLIENT_URL || '').replace(/\/$/, '');
+  const token = req.query.token;
+  const goTo = (flag) => redirectBase
+    ? res.redirect(`${redirectBase}/?verified=${flag}`)
+    : res.status(flag === '1' ? 200 : 400).json({ verified: flag === '1' });
+
+  if(!token) return goTo('0');
+
+  const data = db.readDB();
+  const user = data.users.find(u => u.emailVerifyToken === token);
+  if(!user) return goTo('0');
+
+  const expiresAt = user.emailVerifyTokenExpiresAt ? new Date(user.emailVerifyTokenExpiresAt).getTime() : 0;
+  if(Date.now() > expiresAt) return goTo('expired');
+
+  user.emailVerified = true;
+  delete user.emailVerifyToken;
+  delete user.emailVerifyTokenExpiresAt;
+  db.writeDB(data);
+  return goTo('1');
+});
+
+// Lets a signed-in-but-unverified user request a fresh link (the first one
+// may have expired, landed in spam, or gone to an inbox they checked from a
+// different device). Throttled per user so the resend button can't be
+// spammed into hammering the email provider.
+app.post('/api/resend-verification', requireAuth, async (req, res) => {
+  const data = db.readDB();
+  const user = data.users.find(u => u.id === req.user.id);
+  if(!user) return res.status(401).json({ error: 'Not signed in' });
+  if(user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+
+  const lastSent = user.lastVerificationEmailSentAt ? new Date(user.lastVerificationEmailSentAt).getTime() : 0;
+  if(Date.now() - lastSent < VERIFICATION_EMAIL_MIN_INTERVAL_MS){
+    return res.status(429).json({ error: 'A verification email was just sent — check your inbox (and spam folder) before requesting another.' });
+  }
+
+  user.emailVerifyToken = crypto.randomBytes(32).toString('hex');
+  user.emailVerifyTokenExpiresAt = new Date(Date.now() + EMAIL_VERIFY_TOKEN_TTL_MS).toISOString();
+  user.lastVerificationEmailSentAt = new Date().toISOString();
+  db.writeDB(data);
+
+  const sent = await sendEmail(user.email, 'Verify your ViralCut email', buildVerifyEmailHtml(user));
+  res.json({ ok: true, sent });
 });
 
 app.post('/api/login', async (req, res) => {
@@ -568,6 +699,13 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
   if (source === 'youtube' && user.plan === 'free') {
     return res.status(402).json({
       error: 'Pasting a YouTube link requires a paid plan — try uploading a file instead (free), or subscribe to unlock links.',
+    });
+  }
+
+  if (user.plan === 'free' && !user.emailVerified) {
+    return res.status(403).json({
+      error: 'Verify your email to use your free uploads — check your inbox for the link, or request a new one from your account.',
+      needsVerification: true,
     });
   }
 
@@ -836,6 +974,13 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   usageTotals.proxyBudgetCapUsd = PROXY_MONTHLY_BUDGET_USD;
   usageTotals.proxyBudgetMbUsedThisMonth = Math.round(proxyMbThisMonthSitewide * 10) / 10;
   usageTotals.proxyBudgetMbCapThisMonth = Math.round(PROXY_MONTHLY_MB_CAP_SITEWIDE * 10) / 10;
+
+  // Email verification + marketing-list visibility — how many accounts are
+  // actually confirmed-real, and how many opted into marketing emails (the
+  // list you'd actually be allowed to send a campaign to).
+  usageTotals.verifiedUsers = data.users.filter(u => u.emailVerified).length;
+  usageTotals.unverifiedUsers = data.users.length - usageTotals.verifiedUsers;
+  usageTotals.marketingOptInUsers = data.users.filter(u => u.marketingOptIn).length;
 
   // totals.estMonthlyProfit only nets out each plan's own per-user variable
   // cost (PLAN_EST_COST) — it doesn't touch the SHARED site-wide budgets
