@@ -147,6 +147,25 @@ function issueToken(user){
 const FREE_UPLOAD_LIMIT_PER_WINDOW = 10;
 const FREE_UPLOAD_WINDOW_MS = 4 * 24 * 60 * 60 * 1000; // 4 days
 
+// Referral program — two-sided bonus, granted to BOTH accounts once the
+// referred signup verifies their email (not at signup itself — ties the
+// reward to the same real-address proof the verification gate already
+// requires, so the bonus can't be farmed with disposable emails). Bonus
+// stacks with the free-upload window's normal cap; it never resets itself
+// (freeUploadsUsedInWindow still rolls over every 4 days as usual, the
+// bonus just raises the ceiling for that window).
+const REFERRAL_BONUS_UPLOADS = 5;
+
+function freeUploadCapFor(user){
+  return FREE_UPLOAD_LIMIT_PER_WINDOW + (user.bonusFreeUploads || 0);
+}
+
+function generateReferralCode(data){
+  let code;
+  do { code = crypto.randomBytes(4).toString('hex'); } while(data.users.some(u => u.referralCode === code));
+  return code;
+}
+
 // Very small, dependency-free anti-abuse layer for the free-tier signup
 // bonus. Two independent checks, both best-effort (this is a single-
 // instance file-based app, not a full fraud stack):
@@ -231,6 +250,63 @@ function buildVerifyEmailHtml(user){
       <p><a href="${link}" style="display:inline-block;padding:12px 22px;background:#6c6cff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;">Verify email</a></p>
       <p style="color:#888;font-size:13px;">Or paste this link into your browser:<br>${link}</p>
       <p style="color:#888;font-size:13px;">This link expires in 24 hours.</p>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Marketing campaigns — actually sending to the marketingOptIn list captured
+// at signup. Kept intentionally minimal: no template builder, no scheduling,
+// no analytics — just "compose an email, send it to everyone who said yes,
+// give everyone a working unsubscribe link" (the CAN-SPAM baseline). Trigger
+// a send from campaign-composer.html (ADMIN_KEY-gated, same pattern as
+// admin-gameplay-presets.html) or any HTTP client hitting the endpoint
+// directly.
+//
+// Uses Resend's batch endpoint (up to 100 personalized emails per request)
+// instead of looping single sends — a few hundred recipients would otherwise
+// take minutes serialized against Resend's per-second rate limit, risking a
+// Railway request timeout on the send-campaign call itself.
+// ---------------------------------------------------------------------------
+async function sendCampaignBatch(items){
+  if(!RESEND_API_KEY) return { sent: 0, failed: items.length, skipped: true };
+  const chunks = [];
+  for(let i = 0; i < items.length; i += 100) chunks.push(items.slice(i, i + 100));
+  let sent = 0, failed = 0;
+  for(const chunk of chunks){
+    try{
+      const resp = await fetch('https://api.resend.com/emails/batch', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunk.map(it => ({ from: RESEND_FROM_EMAIL, to: it.to, subject: it.subject, html: it.html }))),
+      });
+      if(resp.ok){ sent += chunk.length; }
+      else { failed += chunk.length; console.error(`[email] campaign batch failed (${resp.status}):`, await resp.text().catch(() => '')); }
+    }catch(err){
+      failed += chunk.length;
+      console.error('[email] campaign batch error:', err.message);
+    }
+    await new Promise(r => setTimeout(r, 400)); // pace batches, stay under Resend's rate limit
+  }
+  return { sent, failed, skipped: false };
+}
+
+function appendUnsubscribeFooter(html, user){
+  const link = `${API_BASE_URL}/api/unsubscribe?token=${user.unsubscribeToken}`;
+  return `${html}<hr style="border:none;border-top:1px solid #333;margin:24px 0;">
+    <p style="font-size:11px;color:#999;font-family:-apple-system,sans-serif;">
+      You're getting this because you opted into ViralCut updates.
+      <a href="${link}" style="color:#999;">Unsubscribe</a>
+    </p>`;
+}
+
+// Referral program — see REFERRAL_BONUS_UPLOADS below for the mechanics.
+// Sent (best-effort) when a referred signup completes verification.
+function buildReferralBonusEmailHtml(referrer, bonusUploads){
+  return `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;color:#222;">
+      <h2 style="margin-bottom:4px;">Your invite just paid off 🎉</h2>
+      <p style="color:#555;">Someone you invited to ViralCut just verified their account — you've both been credited <b>+${bonusUploads} free uploads</b> for this window.</p>
+      <p style="color:#888;font-size:13px;">Keep sharing your link from your account page to keep stacking bonus uploads.</p>
     </div>`;
 }
 
@@ -380,7 +456,7 @@ function effectiveFreeUploadsRemaining(user){
   const startedAt = user.freeUploadWindowStart ? new Date(user.freeUploadWindowStart).getTime() : 0;
   const expired = !user.freeUploadWindowStart || now - startedAt >= FREE_UPLOAD_WINDOW_MS;
   const used = expired ? 0 : (user.freeUploadsUsedInWindow || 0);
-  return Math.max(0, FREE_UPLOAD_LIMIT_PER_WINDOW - used);
+  return Math.max(0, freeUploadCapFor(user) - used);
 }
 
 // When the current window refills, for the frontend to show "resets in
@@ -532,6 +608,11 @@ function publicUser(user, includeToken){
     videosMonthlyCap: PLAN_VIDEO_MONTHLY_LIMITS[user.plan] || null,
     emailVerified: !!user.emailVerified,
     marketingOptIn: !!user.marketingOptIn,
+    referralCode: user.referralCode || null,
+    referralLink: user.referralCode
+      ? `${(process.env.CLIENT_URL || '').replace(/\/$/, '')}/?ref=${user.referralCode}`
+      : null,
+    bonusFreeUploads: user.bonusFreeUploads || 0,
     createdAt: user.createdAt,
   };
   if(includeToken) out.token = user.authToken;
@@ -539,7 +620,7 @@ function publicUser(user, includeToken){
 }
 
 app.post('/api/signup', async (req, res) => {
-  const { email, password, marketingOptIn } = req.body;
+  const { email, password, marketingOptIn, referredBy } = req.body;
   if(!email || !password || password.length < 8){
     return res.status(400).json({ error: 'Enter a valid email and a password with at least 8 characters' });
   }
@@ -556,6 +637,12 @@ app.post('/api/signup', async (req, res) => {
     return res.status(429).json({ error: "Too many free accounts created from this connection recently — subscribe to keep going, or try again later." });
   }
 
+  // referredBy is the CODE from someone else's referral link (?ref=CODE),
+  // not that referrer's ID directly — resolved here, bonus granted later at
+  // verification (see /api/verify-email) so it can't be farmed with an
+  // address that never actually gets confirmed.
+  const referrer = referredBy ? data.users.find(u => u.referralCode === referredBy) : null;
+
   const passwordHash = await bcrypt.hash(password, 10);
   const user = {
     id: crypto.randomUUID(),
@@ -564,6 +651,7 @@ app.post('/api/signup', async (req, res) => {
     plan: 'free',
     freeUploadWindowStart: new Date().toISOString(),
     freeUploadsUsedInWindow: 0,
+    bonusFreeUploads: 0,
     totalProxyMbUsed: 0,
     usagePeriod: currentPeriod(),
     monthlyMinutesUsed: 0,
@@ -575,10 +663,14 @@ app.post('/api/signup', async (req, res) => {
     // Opt-in defaults to false (unchecked on the signup form) — genuine
     // opt-in rather than a pre-checked box, for GDPR/CAN-SPAM hygiene.
     marketingOptIn: !!marketingOptIn,
+    unsubscribeToken: crypto.randomBytes(16).toString('hex'),
     emailVerified: false,
     emailVerifyToken: crypto.randomBytes(32).toString('hex'),
     emailVerifyTokenExpiresAt: new Date(Date.now() + EMAIL_VERIFY_TOKEN_TTL_MS).toISOString(),
     lastVerificationEmailSentAt: new Date().toISOString(),
+    referralCode: generateReferralCode(data),
+    referredByCode: referrer ? referrer.referralCode : null,
+    referralBonusGranted: false,
     createdAt: new Date().toISOString(),
   };
   issueToken(user);
@@ -616,6 +708,41 @@ app.get('/api/verify-email', (req, res) => {
   user.emailVerified = true;
   delete user.emailVerifyToken;
   delete user.emailVerifyTokenExpiresAt;
+
+  // Referral bonus — granted here (at verification) rather than at signup,
+  // so it requires the same proof-of-real-address the free-upload gate
+  // already requires. Two-sided: both accounts get the bonus.
+  if(user.referredByCode && !user.referralBonusGranted){
+    const referrer = data.users.find(u => u.referralCode === user.referredByCode);
+    if(referrer){
+      referrer.bonusFreeUploads = (referrer.bonusFreeUploads || 0) + REFERRAL_BONUS_UPLOADS;
+      user.bonusFreeUploads = (user.bonusFreeUploads || 0) + REFERRAL_BONUS_UPLOADS;
+      user.referralBonusGranted = true;
+      sendEmail(referrer.email, 'Your ViralCut referral just paid off 🎉', buildReferralBonusEmailHtml(referrer, REFERRAL_BONUS_UPLOADS)).catch(() => {});
+    }
+  }
+
+  db.writeDB(data);
+  return goTo('1');
+});
+
+// Unsubscribe link embedded in every campaign email footer (see
+// appendUnsubscribeFooter above) — one click, no login required, sets
+// marketingOptIn back to false. Does NOT touch emailVerified or account
+// access; this only controls the marketing list, not the product itself.
+app.get('/api/unsubscribe', (req, res) => {
+  const redirectBase = (process.env.CLIENT_URL || '').replace(/\/$/, '');
+  const token = req.query.token;
+  const goTo = (flag) => redirectBase
+    ? res.redirect(`${redirectBase}/?unsubscribed=${flag}`)
+    : res.status(200).json({ unsubscribed: flag === '1' });
+
+  if(!token) return goTo('0');
+  const data = db.readDB();
+  const user = data.users.find(u => u.unsubscribeToken === token);
+  if(!user) return goTo('0');
+
+  user.marketingOptIn = false;
   db.writeDB(data);
   return goTo('1');
 });
@@ -712,9 +839,10 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
   if (user.plan === 'free') {
     ensureFreeUploadWindow(user);
     const used = user.freeUploadsUsedInWindow || 0;
-    if (used >= FREE_UPLOAD_LIMIT_PER_WINDOW) {
+    const cap = freeUploadCapFor(user);
+    if (used >= cap) {
       return res.status(402).json({
-        error: `You've used all ${FREE_UPLOAD_LIMIT_PER_WINDOW} free uploads for this 4-day window — it refills ${freeUploadWindowResetAt(user)}, or subscribe for unlimited uploads plus YouTube-link clipping.`,
+        error: `You've used all ${cap} free uploads for this 4-day window — it refills ${freeUploadWindowResetAt(user)}, invite a friend for +${REFERRAL_BONUS_UPLOADS} more, or subscribe for unlimited uploads plus YouTube-link clipping.`,
         freeUploadTriesRemaining: 0,
         freeUploadWindowResetAt: freeUploadWindowResetAt(user),
       });
@@ -767,9 +895,24 @@ app.post('/api/consume-usage', requireAuth, (req, res) => {
 
   user.totalProxyMbUsed = (user.totalProxyMbUsed || 0) + proxyMbUsed;
   recordDailyUsage(user, { minutes: sourceMinutes, proxyMb: proxyMbUsed });
+  // Site-wide counter — powers the public "clips generated" trust badge on
+  // the homepage (see /api/public-stats below). Every successful render
+  // counts once, free or paid.
+  data.totalClipsGenerated = (data.totalClipsGenerated || 0) + 1;
 
   db.writeDB(data);
   res.json(publicUser(user));
+});
+
+// No auth — this is meant to be fetched by anyone visiting the homepage
+// (including signed-out visitors) to show a live "X clips generated" trust
+// badge. Deliberately tiny surface area: two counts, nothing per-user.
+app.get('/api/public-stats', (req, res) => {
+  const data = db.readDB();
+  res.json({
+    totalClipsGenerated: data.totalClipsGenerated || 0,
+    totalUsers: data.users.length,
+  });
 });
 
 /**
@@ -1019,6 +1162,42 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
     usageTotals,
     dailyUsage: buildDailyUsageRollup(data.users, 30),
   });
+});
+
+// Returns how many people a campaign would actually reach right now —
+// verified AND opted-in (unverified addresses are excluded even if they
+// checked the box, since we can't be sure they own the inbox). Lets
+// campaign-composer.html show a live count before you commit to sending.
+app.get('/api/admin/campaign-audience-count', requireAdmin, (req, res) => {
+  const data = db.readDB();
+  const audience = data.users.filter(u => u.marketingOptIn && u.emailVerified).length;
+  res.json({ audience });
+});
+
+// Sends a one-off marketing email to everyone who opted in AND verified
+// their address. Every recipient gets a personalized unsubscribe link
+// appended automatically (appendUnsubscribeFooter) — this can't be turned
+// off, it's the legal baseline for any marketing send. subject/html come
+// straight from campaign-composer.html's form fields.
+app.post('/api/admin/send-campaign', requireAdmin, async (req, res) => {
+  const { subject, html } = req.body;
+  if(!subject || !html){
+    return res.status(400).json({ error: 'subject and html are both required' });
+  }
+
+  const data = db.readDB();
+  const audience = data.users.filter(u => u.marketingOptIn && u.emailVerified && u.unsubscribeToken);
+  if(!audience.length){
+    return res.json({ ok: true, audience: 0, sent: 0, failed: 0 });
+  }
+
+  const items = audience.map(u => ({
+    to: u.email,
+    subject,
+    html: appendUnsubscribeFooter(html, u),
+  }));
+  const result = await sendCampaignBatch(items);
+  res.json({ ok: true, audience: audience.length, ...result });
 });
 
 // Manual plan override — for comping/testing an account without a real
