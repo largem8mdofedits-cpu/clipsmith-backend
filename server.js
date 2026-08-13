@@ -1134,12 +1134,34 @@ const PLAN_PRICES = { starter: 16, pro: 34, elite: 69 };
 // item PROXY_CACHE_SAVINGS_FACTOR (above) says should now be saved — so the
 // admin profit numbers reflect the real infra, not the pre-caching estimate.
 const PLAN_EST_COST_FULL_PRICE = { starter: 3.95, pro: 11.95, elite: 35.08 };
+
+// How many clips a single generate produces on each plan (mirrors
+// CLIP_COUNT_MAX_BY_PLAN in index.html — duplicated here rather than
+// shared since this is a separate Node service from the Python pipeline,
+// and the two only need to agree on the NUMBERS, not share code).
+const PLAN_CLIP_COUNT = { starter: 4, pro: 6, elite: 8 };
+// Real Railway usage-based pricing (railway.com/pricing, confirmed via
+// docs.railway.com/pricing/plans.md): $0.000463/vCPU/min + $0.000231/GB/min.
+// pipeline.py's ffmpeg calls are capped at -threads 2, and a render is
+// roughly 20-40s in practice — 0.5 min and ~0.6GB peak RAM is a reasonable
+// per-clip estimate. Assumes one generate/day at the plan's clip count as
+// a heavy-user ceiling, same "full usage" spirit as the Deepgram/Decodo
+// terms above. Comes out to a few cents/month even at Elite's batch size —
+// clip rendering itself is NOT a meaningful cost driver here, unlike
+// Deepgram/Decodo which scale with source-video minutes.
+const RAILWAY_COST_PER_CLIP_RENDER_USD = (2 * 0.5 * 0.000463) + (0.6 * 0.5 * 0.000231);
+const RAILWAY_RENDER_COST_FULL_PRICE = Object.fromEntries(
+  Object.entries(PLAN_CLIP_COUNT).map(([plan, clipCount]) => [
+    plan, Math.round(clipCount * 30 * RAILWAY_COST_PER_CLIP_RENDER_USD * 100) / 100,
+  ])
+);
 const PLAN_EST_COST = Object.fromEntries(
   Object.entries(PLAN_EST_COST_FULL_PRICE).map(([plan, fullCost]) => {
     const fullDecodoMb = PLAN_MONTHLY_MINUTES[plan] * PROXY_MB_PER_SOURCE_MINUTE;
     const fullDecodoCostUsd = (fullDecodoMb / 1024) * DECODO_COST_PER_GB_USD;
     const savedUsd = fullDecodoCostUsd * (1 - PROXY_CACHE_SAVINGS_FACTOR);
-    return [plan, Math.round((fullCost - savedUsd) * 100) / 100];
+    const withRenderCost = fullCost + (RAILWAY_RENDER_COST_FULL_PRICE[plan] || 0);
+    return [plan, Math.round((withRenderCost - savedUsd) * 100) / 100];
   })
 );
 
